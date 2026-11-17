@@ -60,9 +60,11 @@ mlx-exact takes the arithmetic MLX already uses for long prefills as **canonical
 
 An alternative kernel (`mlx_exact.nax_kernel`) runs MLX's own accelerator implementation (vendored, MIT) with a 16-row tile; the two kernels agree bit for bit.
 
+The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatch, the accelerator's measured accumulation order, the consequences in stock MLX, the method, and the results. The scripts in [`experiments/`](experiments) reproduce the main measurements (stock MLX vs mlx-exact, same run).
+
 ## Limitations
 - **Validated environment:** MLX 0.32.4 on Apple M6 (GPU architecture generation 18). `enable()` refuses other environments unless `force=True`, because the kernel-dispatch replica is version- and chip-specific.
-- **Weights:** unquantized bf16/fp16, or 4- and 8-bit affine quantization with group size 64. Other formats fall back to stock MLX with a warning, and exactness is then not guaranteed.
+- **Weights and activations:** unquantized bf16/fp16, or 4- and 8-bit affine quantization with group size 64; bf16 or fp16 activations. Other formats, and fp32 activations, fall back to stock MLX with a warning, and exactness is then not guaranteed.
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), 8-bit MoE experts, attention sinks combined with a quantized KV cache, and models that call `mx.fast.scaled_dot_product_attention` directly instead of mlx-lm's `scaled_dot_product_attention`.
 - **MoE expert layers** (`QuantizedSwitchLinear` → `gather_qmm`) are supported. MLX's own sorted expert kernel equals the exact kernel per expert, bit for bit.
 - **Speed:** decode is slower than stock. For 4-bit matrices of ≥ 4096 rows, and for most 8-bit matrices, the exact kernels run at 0.8–1.06× of stock speed (kernel time, 4-bit, up to 152k × 1k and 14k × 4k); narrower matrices run at about 0.5×. End-to-end decode is 0.61–0.78× on the models above, and larger models (wider layers) should do better. Long prefills run at stock speed.
@@ -76,6 +78,8 @@ An alternative kernel (`mlx_exact.nax_kernel`) runs MLX's own accelerator implem
 - decode == prefill end to end on a small random-weight MoE model (no download);
 - with LoRA, sampler log-probs == trainer log-probs, and gradients flow, on a small random-weight model (no download);
 - decode == prefill on `mlx-community/Qwen3-0.6B-4bit`, if it is in the local Hugging Face cache.
+- the quantized KV cache: invariance, accuracy against an fp64 reference, and decode == prefill on a small random-weight model;
+- unsupported activation dtypes fall back to stock MLX with a warning.
 
 ## Disclosure
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above.

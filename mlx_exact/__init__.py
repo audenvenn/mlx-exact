@@ -23,7 +23,7 @@ from .dispatch import CANONICAL, dense_stock_path, stock_qmm_path
 from .kernels import (dense_exact, fp32_seq_matmul, gather_qmv_nax_exact, qmv_exact_bits, qmv_exact_v6b,
                       qmv_nax_exact, qmv_nax_exact_v6)
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}
@@ -57,9 +57,13 @@ def quantized_matmul(x, w, scales, biases, group_size=64, bits=4, mode="affine")
     """Drop-in for mx.quantized_matmul(..., transpose=True) with the canonical (long-prefill) arithmetic."""
     K, N = x.shape[-1], w.shape[0]
     M = x.size // K
-    if bits not in (4, 8) or group_size != 64 or mode != "affine" or K % 64 != 0 or biases is None:
-        _warn_once(("q", bits, group_size, mode), f"unsupported quantization (bits={bits}, group={group_size}, "
-                   f"mode={mode}, K={K}); using stock MLX for these layers, exactness not guaranteed")
+    if (bits not in (4, 8) or group_size != 64 or mode != "affine" or K % 64 != 0 or biases is None
+            or x.dtype not in (mx.bfloat16, mx.float16)):
+        # fp32 activations: MLX's canonical kernel then runs at reduced (TF32-like) precision by default
+        # (MLX_ENABLE_TF32=1), which the exact kernels do not emulate
+        _warn_once(("q", bits, group_size, mode, str(x.dtype)), f"unsupported quantized layer (bits={bits}, "
+                   f"group={group_size}, mode={mode}, K={K}, activations {x.dtype}); using stock MLX for these layers, "
+                   "exactness not guaranteed")
         _STATS["unsupported"] = _STATS.get("unsupported", 0) + 1
         return mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size=group_size, bits=bits, mode=mode)
     path = stock_qmm_path(M, N, K, group_size)
@@ -99,9 +103,10 @@ def gather_quantized_matmul(x, w, scales, biases, indices, sorted_indices=False,
     B = 1
     for d in batch:
         B *= d
-    if bits != 4 or group_size != 64 or mode != "affine" or K % 64 != 0 or biases is None:
-        _warn_once(("g", bits, group_size, mode), f"unsupported expert quantization (bits={bits}, group={group_size}, "
-                   f"mode={mode}); using stock MLX, exactness not guaranteed")
+    if (bits != 4 or group_size != 64 or mode != "affine" or K % 64 != 0 or biases is None
+            or x.dtype not in (mx.bfloat16, mx.float16)):
+        _warn_once(("g", bits, group_size, mode, str(x.dtype)), f"unsupported expert quantization (bits={bits}, "
+                   f"group={group_size}, mode={mode}, activations {x.dtype}); using stock MLX, exactness not guaranteed")
         _STATS["gather_unsupported"] = _STATS.get("gather_unsupported", 0) + 1
         return mx.gather_qmm(x, w, scales, biases, rhs_indices=indices, transpose=True, group_size=group_size,
                              bits=bits, mode=mode, sorted_indices=sorted_indices)
