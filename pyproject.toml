@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-exact"
+version = "0.1.0"
+description = "Bit-exact, schedule-invariant inference for MLX / mlx-lm on Apple M5/M6 GPUs"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Auden Venn"}]
+requires-python = ">=3.10"
+dependencies = ["mlx==0.32.4", "numpy"]
+
+[project.optional-dependencies]
+lm = ["mlx-lm>=0.32.2"]
+test = ["pytest", "mlx-lm>=0.32.2"]
+
+[tool.setuptools]
+packages = ["mlx_exact"]
+
+[tool.setuptools.package-data]
+mlx_exact = ["_vendor/mlx_v0_32_4/*"]

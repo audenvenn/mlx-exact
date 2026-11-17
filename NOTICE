@@ -1,0 +1,5 @@
+mlx_exact/_vendor/mlx_v0_32_4/ contains the following files from ml-explore/mlx v0.32.4, unmodified:
+mlx/backend/metal/kernels/steel/defines.h, steel/utils/type_traits.h, steel/utils/integral_constant.h,
+steel/gemm/nax.h and quantized_nax.h. Copyright © 2023-2026 Apple Inc., MIT License (see the LICENSE file in that
+directory). mlx_exact/nax_kernel.py assembles them into a kernel header at run time, dropping three unused
+function-constant declarations and two batching helpers and passing K, N, M by value.
