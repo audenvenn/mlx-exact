@@ -37,6 +37,8 @@ print(mlx_exact.stats())               # which kernels stock MLX would have used
 | Quantized KV cache (8-bit, Qwen3-0.6B-4bit): decode / chunks of 4, 9, 64 vs full prefill | 0 / 300 positions | 300 / 300 |
 | RL with LoRA (Qwen3-0.6B-4bit): sampler vs trainer log-probs of 64 sampled tokens, before and after an optimizer step | 0 / 64 identical (mean \|Δ\| ≈ 0.05 nats/token) | 64 / 64 |
 | Decode throughput (end to end, mlx-lm `generate_step`) | 1× | 0.93× (Qwen3-0.6B-4bit, Qwen3-1.7B-4bit); 0.97× (Qwen3-0.6B-8bit); 0.94× (Qwen3.5-0.8B-4bit); 0.98× (Qwen3.5-0.8B bf16) |
+| Speculative decoding throughput (Qwen3-1.7B-4bit + 0.6B-4bit draft) | 1× | 0.78× (k = 2), 0.83× (k = 4) |
+| Chunked prefill throughput (Qwen3-1.7B-4bit, chunks of 16 / 64 / 128 tokens) | 1× | **1.78× / 1.38× / 1.43×** (faster than stock); one-shot prefill 1.00× |
 
 ## On-policy RL
 In stock MLX, the policy that samples (decode with a KV cache) and the policy that is trained (one forward over prompt + completion) compute different functions. Every sampled token's log-probability differs, by about 0.05 nats on average in our test, so on-policy methods silently become off-policy.
@@ -58,7 +60,7 @@ mlx-exact takes the arithmetic MLX already uses for long prefills as **canonical
   - Query blocks are padded or split so that the same attention kernel always runs.
   - Batched sequences are re-aligned so that their keys start at index 0.
 
-An alternative kernel (`mlx_exact.nax_kernel`) runs MLX's own accelerator implementation (vendored, MIT) with a 16-row tile; the two kernels agree bit for bit.
+For calls with 4 or more rows, mlx-exact runs MLX's own accelerator implementation (vendored, MIT; `mlx_exact.nax_kernel`) with a 16-row tile, which is exact by construction and agrees bit for bit with the emulation kernels.
 
 The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatch, the accelerator's measured accumulation order, the consequences in stock MLX, the method, and the results. The scripts in [`experiments/`](experiments) reproduce the main measurements (stock MLX vs mlx-exact, same run).
 
@@ -67,7 +69,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - **Weights and activations:** unquantized bf16/fp16, or 4- and 8-bit affine quantization with group size 64; bf16 or fp16 activations. Other formats, and fp32 activations, fall back to stock MLX with a warning, and exactness is then not guaranteed.
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), 8-bit MoE experts, attention sinks combined with a quantized KV cache, and models that call `mx.fast.scaled_dot_product_attention` directly instead of mlx-lm's `scaled_dot_product_attention`.
 - **MoE expert layers** (`QuantizedSwitchLinear` → `gather_qmm`) are supported. MLX's own sorted expert kernel equals the exact kernel per expert, bit for bit.
-- **Speed:** end-to-end decode runs at 0.93–0.98× of stock on the models above (Apple M6). Long prefills run at stock speed. A decode step is a chain of dependent matmuls, so each kernel's latency matters more than its throughput. The decode kernels therefore split every output row over many lanes, and keep the canonical summation order with a per-row chain of fp32 additions ([docs/numerics.md](docs/numerics.md), section 4). Calls with several rows use the earlier kernels (one thread per output, or 32-row tiles): 4-bit calls with 2 or more rows, unquantized calls with more than 4, and 8-bit calls with more than 16. These cover speculative verification and small batches, and are exact but slower than stock. MoE expert layers also still use a one-thread-per-output kernel.
+- **Speed:** end-to-end decode runs at 0.93–0.98× of stock on the models above (Apple M6), speculative decoding at 0.78–0.83×, and chunked prefill (chunks of 16–128 tokens) at 1.4–1.8× of stock: for those sizes MLX's own accelerator kernel with a 16-row tile, which mlx-exact runs, is faster than the kernels stock MLX picks. One-shot prefills run at stock speed. A decode step is a chain of dependent matmuls, so each kernel's latency matters more than its throughput. The decode kernels split every output row over many lanes, and keep the canonical summation order with a per-row chain of fp32 additions ([docs/numerics.md](docs/numerics.md), section 4). Remaining slow paths: MoE expert layers (one thread per output), and unquantized layers with more than 4 rows.
 - **Accuracy:** the canonical arithmetic is that of MLX's prefill. Its per-matmul error is slightly higher than stock decode's because of the bf16 weight rounding, which is negligible next to 4-bit quantization error.
 
 ## Tests
@@ -80,6 +82,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - decode == prefill on `mlx-community/Qwen3-0.6B-4bit`, if it is in the local Hugging Face cache.
 - the quantized KV cache: invariance, accuracy against an fp64 reference, and decode == prefill on a small random-weight model;
 - unsupported activation dtypes fall back to stock MLX with a warning.
+- every quantized route (1, 2–4 and more rows; 4- and 8-bit) against MLX's canonical kernel, and decode plus chunk sizes 2–64 against full prefill on small random-weight models.
 
 ## Disclosure
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above.

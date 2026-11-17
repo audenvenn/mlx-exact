@@ -659,3 +659,89 @@ def dense_exact_v7(x, w, producers=8):
                              grid=(((N + 31) // 32) * tg, M, 1), threadgroup=(tg, 1, 1),
                              output_shapes=[(M, N)], output_dtypes=[x.dtype])[0]
     return y.reshape(*lead, N)
+
+
+# v7 for 2-4 x rows (speculative verification, small batches): 8 output rows per threadgroup, so the double buffer of
+# quad sums (rows x 4.6 KB) stays small; producers dequantize each weight once and reuse it for every x row; the chain
+# SIMD group gives each lane one (output row = lane % 8, x row = lane / 8) chain. Same arithmetic as v0/v7.
+_SRC_QMV_EXACT_V7_ROWS = r"""
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint n0 = threadgroup_position_in_grid.x * 8;
+    const uint hf = lane / 16;
+    const uint chunk = lane % 16;
+    constexpr int NT = K_IN / 256;
+    constexpr int PER_WORD = 32 / BITS;
+    constexpr int WPC = 16 / PER_WORD;
+    constexpr int BUF = MR * 4 * 16 * 9;
+    threadgroup float qs[2 * BUF];
+    float acc = 0.0f;
+    const uint crow = lane % 8;
+    const uint cm = lane / 8;
+    for (int kb = 0; kb <= NT; kb++) {
+        if (sg < 2) {
+            if (kb < NT) {
+                threadgroup float* q = qs + (kb & 1) * BUF;
+                const int k0 = kb * 256 + int(chunk) * 16;
+                for (int p = 0; p < 2; p++) {
+                    const uint rl = (sg * 2 + p) * 2 + hf;
+                    const uint n = min(n0 + rl, uint(N_OUT - 1));
+                    const size_t wi = size_t(n) * (K_IN / PER_WORD) + k0 / PER_WORD;
+                    uint32_t ww[WPC];
+                    for (int j = 0; j < WPC; j++) {
+                        ww[j] = w[wi + j];
+                    }
+                    const float s = float(scales[size_t(n) * (K_IN / 64) + k0 / 64]);
+                    const float b = float(biases[size_t(n) * (K_IN / 64) + k0 / 64]);
+                    float wv[16];
+                    for (int i = 0; i < 16; i++) {
+                        wv[i] = float(static_cast<T>(fma(s, float(extract_bits(ww[i / PER_WORD], uint(BITS * (i % PER_WORD)), uint(BITS))), b)));
+                    }
+                    for (int m = 0; m < MR; m++) {
+                        float xs[16];
+                        for (int i = 0; i < 16; i++) {
+                            xs[i] = float(x[size_t(m) * K_IN + k0 + i]);
+                        }
+                        for (int r = 0; r < 4; r++) {
+                            const float pa = fma(wv[2 * r], xs[2 * r], wv[2 * r + 1] * xs[2 * r + 1]);
+                            const float pb = fma(wv[2 * r + 8], xs[2 * r + 8], wv[2 * r + 9] * xs[2 * r + 9]);
+                            q[((m * 4 + r) * 16 + chunk) * 9 + rl] = pa + pb;
+                        }
+                    }
+                }
+            }
+        } else if (kb > 0 && int(cm) < MR) {
+            threadgroup const float* q = qs + ((kb - 1) & 1) * BUF;
+            for (int c = 0; c < 16; c++) {
+                for (int r = 0; r < 4; r++) {
+                    acc = acc + q[((int(cm) * 4 + r) * 16 + c) * 9 + crow];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg == 2 && int(cm) < MR && n0 + crow < N_OUT) {
+        out[size_t(cm) * N_OUT + n0 + crow] = static_cast<T>(acc);
+    }
+"""
+
+
+def qmv_exact_v7_rows(x, w, scales, biases, group_size=64, bits=4):
+    """x[M, K] @ dequant(w).T for 1 <= M <= 4 rows; 4- or 8-bit affine, group 64, K % 256 == 0; canonical arithmetic."""
+    assert bits in (4, 8) and group_size == 64
+    N, kp = w.shape
+    K = kp * (32 // bits)
+    assert K % 256 == 0
+    lead = x.shape[:-1]
+    x2 = x.reshape(-1, K)
+    M = x2.shape[0]
+    assert 1 <= M <= 4
+    if "v7_rows" not in _kernels:
+        _kernels["v7_rows"] = mx.fast.metal_kernel(
+            name="mlx_exact_qmv_v7_rows", input_names=["x", "w", "scales", "biases"], output_names=["out"],
+            source=_SRC_QMV_EXACT_V7_ROWS, compile_options={"math_mode": "safe"})
+    y = _kernels["v7_rows"](inputs=[x2, w, scales, biases],
+                            template=[("T", x.dtype), ("N_OUT", N), ("K_IN", K), ("MR", M), ("BITS", bits)],
+                            grid=(((N + 7) // 8) * 96, 1, 1), threadgroup=(96, 1, 1),
+                            output_shapes=[(M, N)], output_dtypes=[x.dtype])[0]
+    return y.reshape(*lead, N)

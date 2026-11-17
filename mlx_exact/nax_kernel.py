@@ -32,8 +32,8 @@ def _header():
 
 _SRC = r"""
     threadgroup T Ws[64 * (64 + 16 / sizeof(T))];
-    qmm_t_nax_tgp_impl<T, 64, 4, ALIGNED_N, 16, 64, 64, 1, 2>(
-        w, scales, biases, x, out, Ws, K_IN, N_OUT, M_ROWS,
+    qmm_t_nax_tgp_impl<T, 64, BITS, ALIGNED_N, 16, 64, 64, 1, 2>(
+        w, scales, biases, x, out, Ws, int(dims[0]), int(dims[1]), int(dims[2]),
         threadgroup_position_in_grid, thread_index_in_threadgroup,
         simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """
@@ -42,21 +42,23 @@ _k = {}
 
 
 def qmm_nax_exact_v4(x, w, scales, biases, group_size=64, bits=4):
-    """x: [K] or [M, K] (bf16/fp16); w: [N, K/8] uint32 (4-bit, MLX layout); scales, biases: [N, K/64].
+    """x: [K] or [M, K] (bf16/fp16); w: [N, K * bits / 32] uint32 (4- or 8-bit, MLX layout); scales, biases: [N, K/64].
     Output identical (expected bit for bit) to stock qmm_t_nax with 64-row tiles."""
-    assert bits == 4 and group_size == 64
+    assert bits in (4, 8) and group_size == 64
     N, kp = w.shape
-    K = kp * 8
+    K = kp * (32 // bits)
     assert K % 64 == 0
     single = x.ndim == 1
     x2 = x.reshape(-1, K)
     M = x2.shape[0]
     if "v4" not in _k:
         _k["v4"] = mx.fast.metal_kernel(
-            name="qmm_nax_exact_v4", input_names=["x", "w", "scales", "biases"], output_names=["out"],
+            name="qmm_nax_exact_v4", input_names=["x", "w", "scales", "biases", "dims"], output_names=["out"],
             source=_SRC, header=_header(), compile_options={"math_mode": "safe"})
-    y = _k["v4"](inputs=[x2, w, scales, biases],
-                 template=[("T", x.dtype), ("ALIGNED_N", N % 64 == 0), ("K_IN", K), ("N_OUT", N), ("M_ROWS", M)],
+    # K, N and the row count are runtime arguments (as in MLX's own kernels), so new layer shapes and chunk / batch
+    # sizes do not compile new kernel variants
+    y = _k["v4"](inputs=[x2, w, scales, biases, mx.array([K, N, M], dtype=mx.int32)],
+                 template=[("T", x.dtype), ("ALIGNED_N", N % 64 == 0), ("BITS", bits)],
                  grid=(((N + 63) // 64) * 64, (M + 15) // 16, 1), threadgroup=(64, 1, 1),
                  output_shapes=[(M, N)], output_dtypes=[x.dtype])[0]
     return y[0] if single else y
