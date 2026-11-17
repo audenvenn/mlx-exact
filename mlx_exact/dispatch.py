@@ -32,3 +32,17 @@ def stock_qmm_path(M: int, N: int, K: int, group_size: int = 64) -> str:
     if K % 64 == 0:
         return "qmm_t_nax_bm32" if M <= 32 else "qmm_t_nax_bm64"
     return "qmm_t"
+
+
+def dense_stock_path(M: int, N: int, K: int) -> str:
+    """Kernel MLX 0.32.4 picks for a 2-D x[M, K] @ W.T (W [N, K], bf16/fp16) on gen >= 17 (matmul.cpp)."""
+    if M == 1 or N == 1:
+        return "gemv"
+    if 2 <= M <= 14 and K % 4 == 0:
+        return "gemv_wide"
+    if N <= 64 or M <= 64:
+        return "thin_nax"
+    m = max(M, N)
+    if K >= 3 * m or (m <= 1024 and K > 2 * m):
+        return "splitk_nax"
+    return "nax"

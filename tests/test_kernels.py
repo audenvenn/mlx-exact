@@ -22,3 +22,17 @@ def test_kernels_match_canonical_prefill(dtype, N, K):
             y = fn(x[:M], wq, s, b)
             assert mx.array_equal(y, ref[:M]).item(), (fn.__name__, M)
     assert mx.array_equal(qmv_nax_exact(x[0], wq, s, b), ref[0]).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_8bit_kernel_matches_canonical_prefill(dtype):
+    from mlx_exact.kernels import qmv_exact_bits
+    N, K = 2048, 1024
+    rng = np.random.default_rng(88)
+    W = mx.array((rng.standard_normal((N, K)) * 0.02).astype(np.float32)).astype(dtype)
+    x = mx.array(rng.standard_normal((512, K)).astype(np.float32)).astype(dtype)
+    wq, s, b = mx.quantize(W, group_size=64, bits=8)
+    ref = mx.quantized_matmul(x, wq, s, b, transpose=True, group_size=64, bits=8)
+    assert mx.array_equal(qmv_exact_bits(x[:3], wq, s, b, bits=8), ref[:3]).item()
+    from mlx_exact.kernels import qmv_exact_v6b
+    assert mx.array_equal(qmv_exact_v6b(x[:3], wq, s, b, bits=8), ref[:3]).item()
