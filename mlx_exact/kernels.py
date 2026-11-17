@@ -487,3 +487,175 @@ def qkv_attention_exact(queries, q_keys, q_values, scale, mask, group_size=64, b
     return _kernels["qkv_o"](inputs=[p, vq, vs, vb], template=tmpl, grid=(D, L, B * HQ),
                              threadgroup=(min(256, D), 1, 1), output_shapes=[(B, HQ, L, D)],
                              output_dtypes=[queries.dtype])[0]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# v7: exact decode kernel with enough parallelism for narrow layers (4- and 8-bit, group 64, K % 256 == 0).
+# v0/v6 give each lane a whole output row, so a layer with 1024 outputs runs only 32 SIMD groups, and a decode step
+# (a chain of dependent matmuls) waits on each row's long serial loop. v7 splits each row over lanes and keeps the
+# canonical arithmetic: per threadgroup, 32 rows; per 256-weight K tile,
+#   producers (8 SIMD groups, lane = 16-weight chunk) compute the four canonical quad sums of each chunk into one half
+#   of a double buffer in threadgroup memory, while
+#   a chain SIMD group (lane = row) adds the previous tile's quad sums into the row's fp32 accumulator in canonical
+#   order; one barrier per tile.
+# The pair sums use fma(a, b, c * d): products of bf16/fp16 values are exact in fp32, so this equals the canonical
+# round(a * b + c * d) bit for bit.
+# ---------------------------------------------------------------------------------------------------------------------
+_SRC_QMV_EXACT_V7 = r"""    // DQ: round the dequantized fp32 value to T, as MLX's loader does (static_cast<T>), and widen back to float
+    #define DQ(v) float(static_cast<T>(v))
+
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint n0 = threadgroup_position_in_grid.x * 32;
+    const uint m = threadgroup_position_in_grid.y;
+    const uint hf = lane / 16;
+    const uint chunk = lane % 16;
+    constexpr int NT = K_IN / 256;
+    constexpr int PER_WORD = 32 / BITS;
+    constexpr int WPC = 16 / PER_WORD;
+    constexpr int BUF = 4 * 16 * 33;
+    threadgroup float qs[2 * BUF];
+    auto xr = x + size_t(m) * K_IN;
+    float acc = 0.0f;
+    for (int kb = 0; kb <= NT; kb++) {
+        if (sg < P) {
+            if (kb < NT) {
+                threadgroup float* q = qs + (kb & 1) * BUF;
+                const int k0 = kb * 256 + int(chunk) * 16;
+                float xs[16];
+                for (int i = 0; i < 16; i++) {
+                    xs[i] = float(xr[k0 + i]);
+                }
+                for (int p = 0; p < 16 / P; p++) {
+                    const uint rl = (sg * (16 / P) + p) * 2 + hf;
+                    const uint n = min(n0 + rl, uint(N_OUT - 1));
+                    const size_t wi = size_t(n) * (K_IN / PER_WORD) + k0 / PER_WORD;
+                    uint32_t ww[WPC];
+                    for (int j = 0; j < WPC; j++) {
+                        ww[j] = w[wi + j];
+                    }
+                    const float s = float(scales[size_t(n) * (K_IN / 64) + k0 / 64]);
+                    const float b = float(biases[size_t(n) * (K_IN / 64) + k0 / 64]);
+                    float wv[16];
+                    for (int i = 0; i < 16; i++) {
+                        wv[i] = DQ(fma(s, float(extract_bits(ww[i / PER_WORD], uint(BITS * (i % PER_WORD)), uint(BITS))), b));
+                    }
+                    // products are exact in fp32, so fma(a, b, c * d) == round(a * b + c * d): same bits as the
+                    // canonical pair sum p[2r] + p[2r+1]
+                    for (int r = 0; r < 4; r++) {
+                        const float pa = fma(wv[2 * r], xs[2 * r], wv[2 * r + 1] * xs[2 * r + 1]);
+                        const float pb = fma(wv[2 * r + 8], xs[2 * r + 8], wv[2 * r + 9] * xs[2 * r + 9]);
+                        q[(r * 16 + chunk) * 33 + rl] = pa + pb;
+                    }
+                }
+            }
+        } else if (kb > 0) {
+            threadgroup const float* q = qs + ((kb - 1) & 1) * BUF;
+            for (int c = 0; c < 16; c++) {
+                for (int r = 0; r < 4; r++) {
+                    acc = acc + q[(r * 16 + c) * 33 + lane];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg == P && n0 + lane < N_OUT) {
+        out[size_t(m) * N_OUT + n0 + lane] = static_cast<T>(acc);
+    }
+"""
+
+
+def qmv_exact_v7(x, w, scales, biases, group_size=64, bits=4, producers=8):
+    """x[M, K] @ dequant(w).T with the canonical arithmetic (same contract as qmv_nax_exact); 4- or 8-bit affine,
+    group 64, K % 256 == 0. Fastest for decode (M = 1); one threadgroup row per x row."""
+    assert bits in (4, 8) and group_size == 64 and producers in (2, 4, 8)
+    N, kp = w.shape
+    K = kp * (32 // bits)
+    assert K % 256 == 0
+    single = x.ndim == 1
+    x2 = x.reshape(-1, K)
+    M = x2.shape[0]
+    if "v7" not in _kernels:
+        _kernels["v7"] = mx.fast.metal_kernel(
+            name="mlx_exact_qmv_v7", input_names=["x", "w", "scales", "biases"], output_names=["out"],
+            source=_SRC_QMV_EXACT_V7, compile_options={"math_mode": "safe"})
+    tg = (producers + 1) * 32
+    y = _kernels["v7"](inputs=[x2, w, scales, biases],
+                       template=[("T", x.dtype), ("N_OUT", N), ("K_IN", K), ("P", producers), ("BITS", bits)],
+                       grid=(((N + 31) // 32) * tg, M, 1), threadgroup=(tg, 1, 1),
+                       output_shapes=[(M, N)], output_dtypes=[x.dtype])[0]
+    return y[0] if single else y
+
+
+# dense v7: the v7 design for unquantized bf16/fp16 weights (no dequantization); same canonical order as dense_exact.
+_SRC_DENSE_EXACT_V7 = r"""
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint n0 = threadgroup_position_in_grid.x * 32;
+    const uint m = threadgroup_position_in_grid.y;
+    const uint hf = lane / 16;
+    const uint chunk = lane % 16;
+    constexpr int NT = K_IN / 256;
+    constexpr int BUF = 4 * 16 * 33;
+    threadgroup float qs[2 * BUF];
+    auto xr = x + size_t(m) * K_IN;
+    float acc = 0.0f;
+    for (int kb = 0; kb <= NT; kb++) {
+        if (sg < P) {
+            if (kb < NT) {
+                threadgroup float* q = qs + (kb & 1) * BUF;
+                const int k0 = kb * 256 + int(chunk) * 16;
+                float xs[16];
+                for (int i = 0; i < 16; i++) {
+                    xs[i] = float(xr[k0 + i]);
+                }
+                for (int p = 0; p < 16 / P; p++) {
+                    const uint rl = (sg * (16 / P) + p) * 2 + hf;
+                    const uint n = min(n0 + rl, uint(N_OUT - 1));
+                    const size_t wi = size_t(n) * K_IN + k0;
+                    float wv[16];
+                    for (int i = 0; i < 16; i++) {
+                        wv[i] = float(w[wi + i]);
+                    }
+                    // products are exact in fp32, so fma(a, b, c * d) == round(a * b + c * d): same bits as the
+                    // canonical pair sum p[2r] + p[2r+1]
+                    for (int r = 0; r < 4; r++) {
+                        const float pa = fma(wv[2 * r], xs[2 * r], wv[2 * r + 1] * xs[2 * r + 1]);
+                        const float pb = fma(wv[2 * r + 8], xs[2 * r + 8], wv[2 * r + 9] * xs[2 * r + 9]);
+                        q[(r * 16 + chunk) * 33 + rl] = pa + pb;
+                    }
+                }
+            }
+        } else if (kb > 0) {
+            threadgroup const float* q = qs + ((kb - 1) & 1) * BUF;
+            for (int c = 0; c < 16; c++) {
+                for (int r = 0; r < 4; r++) {
+                    acc = acc + q[(r * 16 + c) * 33 + lane];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg == P && n0 + lane < N_OUT) {
+        out[size_t(m) * N_OUT + n0 + lane] = static_cast<T>(acc);
+    }
+"""
+
+
+def dense_exact_v7(x, w, producers=8):
+    """x: [..., K]; w: [N, K] (same dtype as x, bf16/fp16); K % 256 == 0. x @ w.T with the canonical arithmetic;
+    fastest for decode-sized calls (M <= 4)."""
+    N, K = w.shape
+    assert K % 256 == 0 and x.dtype == w.dtype and producers in (2, 4, 8)
+    lead = x.shape[:-1]
+    x2 = x.reshape(-1, K)
+    M = x2.shape[0]
+    if "dense_v7" not in _kernels:
+        _kernels["dense_v7"] = mx.fast.metal_kernel(
+            name="mlx_exact_dense_v7", input_names=["x", "w"], output_names=["out"],
+            source=_SRC_DENSE_EXACT_V7, compile_options={"math_mode": "safe"})
+    tg = (producers + 1) * 32
+    y = _kernels["dense_v7"](inputs=[x2, w], template=[("T", x.dtype), ("N_OUT", N), ("K_IN", K), ("P", producers)],
+                             grid=(((N + 31) // 32) * tg, M, 1), threadgroup=(tg, 1, 1),
+                             output_shapes=[(M, N)], output_dtypes=[x.dtype])[0]
+    return y.reshape(*lead, N)

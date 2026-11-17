@@ -61,6 +61,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
 - **Matmuls.** A Python replica of MLX's dispatch decides per call whether stock would run the canonical kernel (`qmm_t_nax` with 64-row tiles; the regular accelerator GEMM; `gather_qmm_rhs`). Otherwise the call runs an exact kernel:
   - **v0:** one thread per output, a scalar emulation of the accelerator order, with weights rounded exactly as the loader rounds them;
   - **v6/v6b:** coalesced 32-row tiles with prefetch, the same arithmetic;
+  - **v7** (decode, 4- and 8-bit, and unquantized): each output row split over many lanes, see *Speed* below;
   - an expert-indexed variant for MoE, and a dense variant without dequantization.
 - **Attention.**
   - Query blocks below the accelerator threshold are padded to 9 queries, or 16 for head dims 192/256. The real queries go last under a causal, bottom-aligned mask. If the context is shorter than the padding, a square problem with zero keys (always masked) is used instead.
@@ -69,6 +70,11 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
   - Masked keys contribute exact zeros, so this reproduces the canonical rows bit for bit.
 - **Paths that mlx-lm composes from several MLX ops** (quantized KV-cache attention, LoRA adapters) have no single MLX kernel to take as canonical, so mlx-exact defines the arithmetic itself: fixed-order fp32 kernels that are identical for every query or row count. Checked against fp64, the quantized-KV attention is as accurate as stock decode, and the LoRA kernel is accurate to fp32 rounding.
 - **Gradients.** Every exact route is an `mx.custom_function` whose backward pass uses stock MLX ops. Gradients need not be bit-exact; only the forward must match, e.g. the sampler's and the trainer's log-probabilities.
+- **Speed.** A decode step is a chain of dependent matmuls, so a kernel's *latency* matters more than its throughput.
+  - With one thread per output row, every lane runs a K-long serial loop, and a 1024-output layer occupies only 32 SIMD groups. In a dependent chain this was 2.3–3.4× slower than stock per call on 0.6B-sized layers, although back-to-back independent calls were only 1.2–1.5× slower (the GPU overlaps them).
+  - **v7** keeps the canonical order but splits each row. Per threadgroup of 32 rows and per 256-weight K tile, 8 producer SIMD groups (lane = 16-weight chunk) compute every chunk's four quad sums into a double buffer in threadgroup memory. Meanwhile a chain SIMD group (lane = row) adds the previous tile's quad sums into each row's fp32 accumulator in canonical order, with one barrier per tile.
+  - The pair sums use `fma(a, b, c·d)`. Products of bf16/fp16 values are exact in fp32, so this equals the canonical `round(a·b + c·d)` bit for bit.
+  - Register prefetch and integer bf16 rounding were tried and did not help.
 
 ## 5. Results with mlx-exact
 | Test | mlx-exact |
@@ -77,7 +83,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
 | greedy with cache vs recompute; greedy speculative vs plain (5 / 5); batched vs alone (4 / 4) | identical |
 | quantized KV cache (8-bit) | 300 / 300 positions identical |
 | RL with LoRA: sampler vs trainer log-probs, before and after an optimizer step | 64 / 64 identical |
-| decode throughput | 0.61–0.78× of stock on 0.6–1.7B models (narrow layers are the slowest; wide 4-bit and most 8-bit layers run at 0.8–1.06× in isolation) |
+| decode throughput (mlx-lm `generate_step`) | 0.93× of stock (Qwen3-0.6B-4bit: 306 vs 330 tok/s; Qwen3-1.7B-4bit: 126 vs 136), 0.97× (Qwen3-0.6B-8bit), 0.94× (Qwen3.5-0.8B-4bit), 0.98× (Qwen3.5-0.8B bf16). Before v7: 0.68–0.79× |
 
 ## 6. Pitfalls found along the way
 - mlx-lm's `quantized_scaled_dot_product_attention` scales its `queries` argument with `*=`, which updates the caller's array object in place. Inside a model this is harmless, but a test that reuses the same query array across calls silently feeds pre-scaled queries to later calls (it cost us a false alarm).

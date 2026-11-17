@@ -36,3 +36,18 @@ def test_8bit_kernel_matches_canonical_prefill(dtype):
     assert mx.array_equal(qmv_exact_bits(x[:3], wq, s, b, bits=8), ref[:3]).item()
     from mlx_exact.kernels import qmv_exact_v6b
     assert mx.array_equal(qmv_exact_v6b(x[:3], wq, s, b, bits=8), ref[:3]).item()
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("N,K", [(1024, 1024), (2048, 1024), (1024, 3072), (1000, 512), (6144, 2048)])
+def test_v7_decode_kernel_matches_canonical_prefill(bits, dtype, N, K):
+    from mlx_exact.kernels import qmv_exact_v7
+    rng = np.random.default_rng(N + K + bits)
+    W = mx.array((rng.standard_normal((N, K)) * 0.02).astype(np.float32)).astype(dtype)
+    x = mx.array(rng.standard_normal((512, K)).astype(np.float32)).astype(dtype)
+    wq, s, b = mx.quantize(W, group_size=64, bits=bits)
+    ref = mx.quantized_matmul(x, wq, s, b, transpose=True, group_size=64, bits=bits)
+    for M in (1, 3, 16):
+        assert mx.array_equal(qmv_exact_v7(x[:M], wq, s, b, 64, bits), ref[:M]).item(), M
+    assert mx.array_equal(qmv_exact_v7(x[5], wq, s, b, 64, bits), ref[5]).item()

@@ -20,10 +20,10 @@ import mlx.nn as nn
 from .attention import STATS as _ATT_STATS
 from .attention import exact_sdpa
 from .dispatch import CANONICAL, dense_stock_path, stock_qmm_path
-from .kernels import (dense_exact, fp32_seq_matmul, gather_qmv_nax_exact, qmv_exact_bits, qmv_exact_v6b,
-                      qmv_nax_exact, qmv_nax_exact_v6)
+from .kernels import (dense_exact, dense_exact_v7, fp32_seq_matmul, gather_qmv_nax_exact, qmv_exact_bits,
+                      qmv_exact_v6b, qmv_exact_v7, qmv_nax_exact, qmv_nax_exact_v6)
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}
@@ -70,11 +70,13 @@ def quantized_matmul(x, w, scales, biases, group_size=64, bits=4, mode="affine")
     _STATS[path] = _STATS.get(path, 0) + 1
     if path == CANONICAL:
         return mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size=group_size, bits=bits)
+    # All routes below are bit-identical; the choice is speed only (Apple M6, dependent-chain and end-to-end timing):
+    # v7 (rows split over lanes) for decode-sized calls; v0 / v6 / v6b give more rows per thread for larger M.
+    if K % 256 == 0 and (M == 1 or (bits == 8 and M <= 16)):
+        return qmv_exact_v7(x.reshape(M, K), w, scales, biases, group_size, bits).reshape(*x.shape[:-1], N)
     if bits == 8:
         k8 = qmv_exact_v6b if K % 128 == 0 else qmv_exact_bits
         return k8(x.reshape(M, K), w, scales, biases, group_size, 8).reshape(*x.shape[:-1], N)
-    # v6 (coalesced 32-row tiles) is faster for wide layers (N >= 4096); v0 (one thread per output) for narrower ones.
-    # Both are exact (interleaved benchmark on M6, FINDINGS F18).
     kern = qmv_nax_exact_v6 if (K % 256 == 0 and N >= 4096) else qmv_nax_exact
     return kern(x.reshape(M, K), w, scales, biases, group_size, bits).reshape(*x.shape[:-1], N)
 
@@ -90,6 +92,8 @@ def dense_matmul(x, w):
             _warn_once(("d", str(x.dtype), str(w.dtype)), f"unsupported dense layer (x {x.dtype}, w {w.dtype}, K={K}); "
                        "using stock MLX, exactness not guaranteed")
         return (x.reshape(M, K) @ w.T).reshape(*x.shape[:-1], N)
+    if K % 256 == 0 and M <= 4:
+        return dense_exact_v7(x, w)                     # same arithmetic; rows split over lanes (decode-sized calls)
     return dense_exact(x, w)
 
 
