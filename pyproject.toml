@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-exact"
-version = "0.2.0"
+version = "0.3.0"
 description = "Bit-exact, schedule-invariant inference for MLX / mlx-lm on Apple M5/M6 GPUs"
 readme = "README.md"
 license = {text = "MIT"}

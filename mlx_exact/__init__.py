@@ -23,7 +23,7 @@ from .dispatch import CANONICAL, dense_stock_path, stock_qmm_path
 from .kernels import (dense_exact, fp32_seq_matmul, gather_qmv_nax_exact, qmv_exact_bits, qmv_exact_v6b,
                       qmv_nax_exact, qmv_nax_exact_v6)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}

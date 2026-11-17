@@ -8,6 +8,8 @@ long prefills, whatever the number of queries in the call, the context length or
 """
 import mlx.core as mx
 
+from .kernels import qkv_attention_exact
+
 STATS = {}
 
 
@@ -40,7 +42,12 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
     """queries [B, Hq, L, D]. For L <= 8 pad to 9 rows (copies of the first row placed BEFORE the real rows) and use
     a causal mask, so MLX runs the full-attention kernel; return the last L rows."""
     if hasattr(cache, "bits"):
-        raise NotImplementedError("exact mode: quantized KV cache not supported")
+        # quantized KV cache: mlx-lm's own composition (two quantized matmuls + precise softmax); its arithmetic is
+        # defined here by fixed-order kernels, the same for every query count
+        if sinks is not None:
+            raise NotImplementedError("exact mode: attention sinks with a quantized KV cache")
+        STATS["quantized_kv"] = STATS.get("quantized_kv", 0) + 1
+        return qkv_attention_exact(queries, keys, values, scale, mask, cache.group_size, cache.bits)
     L = queries.shape[2]
     D = queries.shape[3]
     if mask is not None and not isinstance(mask, str):

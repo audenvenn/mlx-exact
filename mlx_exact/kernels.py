@@ -17,10 +17,10 @@ _SRC_QMV_NAX_EXACT = r"""
     if (n >= N_OUT) {
         return;
     }
-    const device T* xr = x + size_t(m) * K_IN;
-    const device uint32_t* wr = w + size_t(n) * (K_IN / 8);
-    const device T* sr = scales + size_t(n) * (K_IN / GS);
-    const device T* br = biases + size_t(n) * (K_IN / GS);
+    auto xr = x + size_t(m) * K_IN;
+    auto wr = w + size_t(n) * (K_IN / 8);
+    auto sr = scales + size_t(n) * (K_IN / GS);
+    auto br = biases + size_t(n) * (K_IN / GS);
     float acc = 0.0f;
     for (int c0 = 0; c0 < K_IN; c0 += 16) {
         const float s = float(sr[c0 / GS]);
@@ -81,9 +81,9 @@ _SRC_QMV_NAX_EXACT_V6 = r"""
     threadgroup uint32_t* wt = tiles + sg * (32 * 33);
     const uint n = n0 + lane;
     const uint nn = (n < N_OUT) ? n : (N_OUT - 1);
-    const device T* xr = x + size_t(m) * K_IN;
-    const device T* sr = scales + size_t(nn) * (K_IN / 64);
-    const device T* br = biases + size_t(nn) * (K_IN / 64);
+    auto xr = x + size_t(m) * K_IN;
+    auto sr = scales + size_t(nn) * (K_IN / 64);
+    auto br = biases + size_t(nn) * (K_IN / 64);
     uint32_t pre[32];
     for (int r = 0; r < 32; r++) {
         const uint nr = min(n0 + r, uint(N_OUT - 1));
@@ -156,10 +156,10 @@ _SRC_GATHER_EXACT = r"""
         return;
     }
     const uint e = idx[m];
-    const device T* xr = x + size_t(m) * K_IN;
-    const device uint32_t* wr = w + (size_t(e) * N_OUT + n) * (K_IN / 8);
-    const device T* sr = scales + (size_t(e) * N_OUT + n) * (K_IN / GS);
-    const device T* br = biases + (size_t(e) * N_OUT + n) * (K_IN / GS);
+    auto xr = x + size_t(m) * K_IN;
+    auto wr = w + (size_t(e) * N_OUT + n) * (K_IN / 8);
+    auto sr = scales + (size_t(e) * N_OUT + n) * (K_IN / GS);
+    auto br = biases + (size_t(e) * N_OUT + n) * (K_IN / GS);
     float acc = 0.0f;
     for (int c0 = 0; c0 < K_IN; c0 += 16) {
         const float s = float(sr[c0 / GS]);
@@ -209,10 +209,10 @@ _SRC_QMV_EXACT_BITS = r"""
     }
     constexpr int PER_WORD = 32 / BITS;                 // values per uint32
     constexpr uint MASK = (1u << BITS) - 1u;
-    const device T* xr = x + size_t(m) * K_IN;
-    const device uint32_t* wr = w + size_t(n) * (K_IN / PER_WORD);
-    const device T* sr = scales + size_t(n) * (K_IN / GS);
-    const device T* br = biases + size_t(n) * (K_IN / GS);
+    auto xr = x + size_t(m) * K_IN;
+    auto wr = w + size_t(n) * (K_IN / PER_WORD);
+    auto sr = scales + size_t(n) * (K_IN / GS);
+    auto br = biases + size_t(n) * (K_IN / GS);
     float acc = 0.0f;
     for (int c0 = 0; c0 < K_IN; c0 += 16) {
         const float s = float(sr[c0 / GS]);
@@ -266,9 +266,9 @@ _SRC_QMV_EXACT_V6B = r"""
     threadgroup uint32_t* wt = tiles + sg * (32 * 33);
     const uint n = n0 + lane;
     const uint nn = (n < N_OUT) ? n : (N_OUT - 1);
-    const device T* xr = x + size_t(m) * K_IN;
-    const device T* sr = scales + size_t(nn) * (K_IN / 64);
-    const device T* br = biases + size_t(nn) * (K_IN / 64);
+    auto xr = x + size_t(m) * K_IN;
+    auto sr = scales + size_t(nn) * (K_IN / 64);
+    auto br = biases + size_t(nn) * (K_IN / 64);
     uint32_t pre[32];
     for (int r = 0; r < 32; r++) {
         const uint nr = min(n0 + r, uint(N_OUT - 1));
@@ -338,8 +338,8 @@ _SRC_DENSE_EXACT = r"""
     if (n >= N_OUT) {
         return;
     }
-    const device T* xr = x + size_t(m) * K_IN;
-    const device T* wr = w + size_t(n) * K_IN;
+    auto xr = x + size_t(m) * K_IN;
+    auto wr = w + size_t(n) * K_IN;
     float acc = 0.0f;
     for (int c0 = 0; c0 < K_IN; c0 += 16) {
         float p[16];
@@ -380,7 +380,7 @@ _SRC_FP32_SEQ = r"""
     if (n >= N_OUT) {
         return;
     }
-    const device T* xr = x + size_t(m) * K_IN;
+    auto xr = x + size_t(m) * K_IN;
     float acc = 0.0f;
     for (int k = 0; k < K_IN; k++) {
         acc = fma(float(xr[k]), w[size_t(k) * N_OUT + n], acc);
@@ -403,3 +403,87 @@ def fp32_seq_matmul(x, w):
                             grid=(N, M, 1), threadgroup=(min(256, N), 1, 1),
                             output_shapes=[(M, N)], output_dtypes=[mx.float32])[0]
     return y.reshape(*lead, N)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Quantized-KV-cache attention (mlx-lm's quantized_scaled_dot_product_attention) with a fixed arithmetic for any number
+# of queries. Keys/values are affine-quantized along the head dim D (groups of GS within each key/value row).
+#   scores[b, h, l, j] = sum_d q[b, h, l, d] * deq(K[b, kvh(h), j, d])     (fp32, d ascending, fma)
+#   out[b, h, l, d]    = sum_j p[b, h, l, j] * deq(V[b, kvh(h), j, d])     (fp32, j ascending, fma)
+# deq(v) = float(s) * q + float(b) (MLX's affine dequantization). Scores/outputs are cast to the query dtype at the end,
+# as mx.quantized_matmul returns the input dtype.
+_SRC_QKV_SCORES = r"""
+    const uint j = thread_position_in_grid.x;            // key index
+    const uint l = thread_position_in_grid.y;            // query index
+    const uint bh = thread_position_in_grid.z;           // b * HQ + h
+    if (j >= KL) { return; }
+    const uint b = bh / HQ, h = bh % HQ, kvh = h / (HQ / HKV);
+    constexpr int PER_WORD = 32 / BITS;
+    constexpr uint MASK = (1u << BITS) - 1u;
+    auto qr = q + (size_t(bh) * L + l) * D;
+    const size_t krow = (size_t(b) * HKV + kvh) * KL + j;
+    auto kw = kq + krow * (D / PER_WORD);
+    auto ks = kscales + krow * (D / GS);
+    auto kb = kbiases + krow * (D / GS);
+    float acc = 0.0f;
+    for (int d = 0; d < D; d++) {
+        const uint qv = (kw[d / PER_WORD] >> (BITS * (d % PER_WORD))) & MASK;
+        const float kv = float(ks[d / GS]) * float(qv) + float(kb[d / GS]);
+        acc = fma(float(qr[d]), kv, acc);
+    }
+    out[(size_t(bh) * L + l) * KL + j] = static_cast<T>(acc);
+"""
+
+_SRC_QKV_OUT = r"""
+    const uint d = thread_position_in_grid.x;            // head-dim index
+    const uint l = thread_position_in_grid.y;
+    const uint bh = thread_position_in_grid.z;
+    if (d >= D) { return; }
+    const uint b = bh / HQ, h = bh % HQ, kvh = h / (HQ / HKV);
+    constexpr int PER_WORD = 32 / BITS;
+    constexpr uint MASK = (1u << BITS) - 1u;
+    auto pr = p + (size_t(bh) * L + l) * KL;
+    float acc = 0.0f;
+    for (int j = 0; j < KL; j++) {
+        const size_t vrow = (size_t(b) * HKV + kvh) * KL + j;
+        const uint qv = (vq[vrow * (D / PER_WORD) + d / PER_WORD] >> (BITS * (d % PER_WORD))) & MASK;
+        const float vv = float(vscales[vrow * (D / GS) + d / GS]) * float(qv) + float(vbiases[vrow * (D / GS) + d / GS]);
+        acc = fma(float(pr[j]), vv, acc);
+    }
+    out[(size_t(bh) * L + l) * D + d] = static_cast<T>(acc);
+"""
+
+
+def qkv_attention_exact(queries, q_keys, q_values, scale, mask, group_size=64, bits=8):
+    """Drop-in for mlx-lm's quantized_scaled_dot_product_attention with a query-count-invariant arithmetic.
+    queries [B, HQ, L, D]; q_keys / q_values = (packed [B, HKV, kL, D*bits/32], scales, biases)."""
+    B, HQ, L, D = queries.shape
+    kq, ks, kb = q_keys
+    vq, vs, vb = q_values
+    HKV, KL = kq.shape[1], kq.shape[2]
+    q = (queries * scale)                                   # same scaling as mlx-lm (in the query dtype)
+    tmpl = [("T", queries.dtype), ("HQ", HQ), ("HKV", HKV), ("L", L), ("KL", KL), ("D", D), ("GS", group_size),
+            ("BITS", bits)]
+    if "qkv_s" not in _kernels:
+        _kernels["qkv_s"] = mx.fast.metal_kernel(
+            name="qkv_scores_exact", input_names=["q", "kq", "kscales", "kbiases"], output_names=["out"],
+            source=_SRC_QKV_SCORES, compile_options={"math_mode": "safe"})
+        _kernels["qkv_o"] = mx.fast.metal_kernel(
+            name="qkv_out_exact", input_names=["p", "vq", "vscales", "vbiases"], output_names=["out"],
+            source=_SRC_QKV_OUT, compile_options={"math_mode": "safe"})
+    scores = _kernels["qkv_s"](inputs=[q, kq, ks, kb], template=tmpl, grid=(KL, L, B * HQ),
+                               threadgroup=(min(256, KL), 1, 1), output_shapes=[(B, HQ, L, KL)],
+                               output_dtypes=[queries.dtype])[0]
+    if mask is not None:
+        if isinstance(mask, str):
+            qi = mx.arange(KL - L, KL)
+            ki = mx.arange(KL)
+            mask = qi[:, None] >= ki[None]
+        if mask.dtype == mx.bool_:
+            scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+        else:
+            scores = scores + mask
+    p = mx.softmax(scores, axis=-1, precise=True)
+    return _kernels["qkv_o"](inputs=[p, vq, vs, vb], template=tmpl, grid=(D, L, B * HQ),
+                             threadgroup=(min(256, D), 1, 1), output_shapes=[(B, HQ, L, D)],
+                             output_dtypes=[queries.dtype])[0]
