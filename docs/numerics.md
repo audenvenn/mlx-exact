@@ -54,7 +54,7 @@ Different kernels are not only different summation orders.
 | Greedy speculative decoding (Qwen3-1.7B-4bit + 0.6B-4bit draft, 200 tokens) vs plain greedy | output changes on 4 / 5 prompts; first change at tokens 1–82 |
 | Batched generation (mlx-lm `BatchGenerator`, left padding) vs each prompt alone | 3 / 4 prompts change |
 | RL with LoRA (Qwen3-0.6B-4bit, random rank-8 adapter): sampler (decode) vs trainer (full forward) log-probs of 64 sampled tokens | 0 / 64 identical for each prompt; mean \|Δ\| 0.04–0.06 nats, max up to 0.26 (depends on the adapter) |
-| GSM8K (100 problems, Qwen3-1.7B-4bit, greedy): one-shot prefill vs prefill in chunks of 16 vs batches of 8 | 67–71% of solutions and 14–18% of final answers change; accuracy 75% / 80% / 75% (McNemar p = 0.18: noise) |
+| GSM8K (300 problems, greedy; Qwen3-0.6B 4/8-bit, Qwen3-1.7B-4bit, Qwen3.5-0.8B-4bit): one-shot prefill, prefill chunks of 64 / 16, batches of 4 / 8 | 20–60% of problems change their final answer under some schedule; accuracy spreads 2.3–3.0 points (not significant) |
 
 ## 4. Method: one canonical arithmetic
 mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so long prefills keep full accelerator speed, and reroutes every call that would leave it.

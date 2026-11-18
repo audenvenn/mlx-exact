@@ -32,11 +32,21 @@ print(mlx_exact.stats())               # which kernels stock MLX would have used
 
 ## Results (Apple M6, MLX 0.32.4, mlx-lm 0.32.2)
 
-**Why it matters, on a benchmark:** GSM8K, first 100 test problems, Qwen3-1.7B-4bit, greedy.
-- In stock MLX, prefilling the prompt in chunks of 16 tokens instead of all at once changed 67 of the 100 generated solutions and **18 of the 100 final answers**, and accuracy moved from 75% to 80%.
-- Batched generation (8 per batch) changed 14 answers.
-- The flips go both ways (McNemar p = 0.18), so the accuracy gap is scheduling noise, not an effect.
-- With mlx-exact every schedule gives the same 100 answers (accuracy 80% throughout), at 0.88× of the stock wall time.
+**Why it matters, on a benchmark:** GSM8K, first 300 test problems, greedy decoding. In stock MLX, five common ways of running the same prompts give different final answers:
+- the whole prompt prefilled at once;
+- the prompt prefilled in chunks of 64 or of 16 tokens;
+- batches of 4 or of 8.
+
+| Model | Stock accuracy across the 5 schedules | Problems whose answer changes under some schedule | mlx-exact |
+|---|---|---|---|
+| Qwen3-0.6B-4bit | 45.7–48.7% | 154 / 300 (51%) | same answers under every schedule |
+| Qwen3-0.6B-8bit | 62.3–65.3% | 90 / 300 (30%) | same answers under every schedule |
+| Qwen3-1.7B-4bit | 77.7–80.0% | 59 / 300 (20%) | same answers under every schedule |
+| Qwen3.5-0.8B-4bit | 41.0–43.7% | 179 / 300 (60%) | same answers under every schedule |
+
+Aggregate accuracy moves by up to 3 points (not significant: the flips go both ways), but per-problem answers depend heavily on the schedule. That noise affects any paired comparison on the same problems.
+
+With mlx-exact the answers are identical under every schedule. The cost is 0.86–0.93× of the stock wall time for single sequences, and 0.35–0.72× for batches of 8.
 
 
 | Test | Stock MLX | With mlx-exact |
