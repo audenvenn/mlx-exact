@@ -17,7 +17,7 @@ BASE = dict(hidden_size=256, num_hidden_layers=2, intermediate_size=512, num_att
             tie_word_embeddings=True)
 CFG = {
     "llama": {}, "qwen2": {}, "phi3": {}, "olmo2": {}, "internlm3": {}, "smollm3": {},
-    "hunyuan_v1_dense": {}, "seed_oss": {}, "starcoder2": {},
+    "hunyuan_v1_dense": {}, "seed_oss": dict(tie_word_embeddings=False), "starcoder2": {},
     "gemma2": dict(query_pre_attn_scalar=64),
     "gemma3_text": dict(query_pre_attn_scalar=64, sliding_window=32, sliding_window_pattern=2),
     "granite": dict(logits_scaling=1.0, attention_multiplier=0.125, embedding_multiplier=1.0, residual_multiplier=1.0,
