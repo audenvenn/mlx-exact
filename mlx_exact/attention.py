@@ -8,7 +8,7 @@ long prefills, whatever the number of queries in the call, the context length or
 """
 import mlx.core as mx
 
-from .kernels import dense_attention_exact, qkv_attention_exact
+from .kernels import dense_attention_exact, qkv_attention_exact, shift_rows_left
 
 STATS = {}
 _WARNED = set()
@@ -41,11 +41,9 @@ def _align_left_padding(keys, values, mask):
     j = mx.arange(kL).reshape(1, 1, 1, kL)
     src = j + pad
     valid = src < kL
-    idx_k = mx.broadcast_to(mx.minimum(src, kL - 1).reshape(B, 1, kL, 1), (B, Hk, kL, Dk))
-    k2 = mx.where(mx.broadcast_to(valid.reshape(B, 1, kL, 1), k2s := (B, Hk, kL, Dk)), mx.take_along_axis(keys, idx_k, axis=2), 0)
-    v2 = mx.where(mx.broadcast_to(valid.reshape(B, 1, kL, 1), (B, values.shape[1], kL, values.shape[3])),
-                  mx.take_along_axis(values, mx.broadcast_to(mx.minimum(src, kL - 1).reshape(B, 1, kL, 1),
-                                                             (B, values.shape[1], kL, values.shape[3])), axis=2), 0)
+    # shifted copies of K and V (per-sequence offset, zeros past the end): a plain copy kernel, no index arrays
+    k2 = shift_rows_left(keys, pad.reshape(B))
+    v2 = shift_rows_left(values, pad.reshape(B))
     mb = mx.broadcast_to(m, (B, m.shape[1], m.shape[2], kL))
     idx_m = mx.broadcast_to(mx.minimum(src, kL - 1), mb.shape)
     m2 = mx.logical_and(mx.take_along_axis(mb, idx_m, axis=-1), mx.broadcast_to(valid, mb.shape))

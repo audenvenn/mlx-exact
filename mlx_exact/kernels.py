@@ -924,3 +924,30 @@ def dense_attention_exact(queries, keys, values, scale, mask):
     return _kernels["datt_o"](inputs=[p, values, dims], template=tmpl, grid=(D, L, B * HQ),
                               threadgroup=(min(256, D), 1, 1), output_shapes=[(B, HQ, L, D)],
                               output_dtypes=[queries.dtype])[0]
+
+
+# Per-sequence left shift of K / V rows (key re-alignment for batched left padding): out[b, h, j] = x[b, h, j + pad[b]],
+# zeros past the end. A plain copy kernel (no index arrays); sizes are runtime arguments.
+_SRC_SHIFT_ROWS = r"""
+    const uint d = thread_position_in_grid.x;
+    const uint j = thread_position_in_grid.y;
+    const uint bh = thread_position_in_grid.z;
+    const int KL = int(dims[0]);
+    const int H = int(dims[1]);
+    const int D = int(dims[2]);
+    if (int(d) >= D || int(j) >= KL) { return; }
+    const int b = int(bh) / H;
+    const int src = int(j) + int(pad[b]);
+    out[(size_t(bh) * KL + j) * D + d] = (src < KL) ? x[(size_t(bh) * KL + src) * D + d] : T(0);
+"""
+
+
+def shift_rows_left(x, pad):
+    """x [B, H, kL, D]; pad [B] int: out[b, :, j] = x[b, :, j + pad[b]] (zeros where j + pad[b] >= kL)."""
+    B, H, KL, D = x.shape
+    if "shift_rows" not in _kernels:
+        _kernels["shift_rows"] = mx.fast.metal_kernel(name="mlx_exact_shift_rows", input_names=["x", "pad", "dims"],
+                                                      output_names=["out"], source=_SRC_SHIFT_ROWS)
+    return _kernels["shift_rows"](inputs=[x, pad.astype(mx.int32), mx.array([KL, H, D], dtype=mx.int32)],
+                                  template=[("T", x.dtype)], grid=(D, KL, B * H), threadgroup=(min(D, 128), 1, 1),
+                                  output_shapes=[x.shape], output_dtypes=[x.dtype])[0]
