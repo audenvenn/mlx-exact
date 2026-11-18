@@ -22,9 +22,9 @@ from .attention import exact_sdpa
 from .dispatch import CANONICAL, dense_stock_path, stock_qmm_path
 from .kernels import (dense_exact, dense_exact_v7, fp32_seq_matmul, gather_qmv_exact_v7, gather_qmv_nax_exact,
                       qmv_exact_bits, qmv_exact_v7, qmv_exact_v7_rows, qmv_nax_exact)
-from .nax_kernel import qmm_nax_exact_v4
+from .nax_kernel import dense_nax_exact_v4, qmm_nax_exact_v4
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}
@@ -100,9 +100,11 @@ def dense_matmul(x, w):
             _warn_once(("d", str(x.dtype), str(w.dtype)), f"unsupported dense layer (x {x.dtype}, w {w.dtype}, K={K}); "
                        "using stock MLX, exactness not guaranteed")
         return (x.reshape(M, K) @ w.T).reshape(*x.shape[:-1], N)
+    # same arithmetic on every route: v7 (rows split over lanes) for decode-sized calls; otherwise MLX's own dense
+    # accelerator GEMM loop (vendored) with a 16-row tile, or with stock's own 128-row tile above 64 rows
     if K % 256 == 0 and M <= 4:
-        return dense_exact_v7(x, w)                     # same arithmetic; rows split over lanes (decode-sized calls)
-    return dense_exact(x, w)
+        return dense_exact_v7(x, w)
+    return dense_nax_exact_v4(x, w, 16 if M <= 64 else 128)
 
 
 def gather_quantized_matmul(x, w, scales, biases, indices, sorted_indices=False, group_size=64, bits=4,

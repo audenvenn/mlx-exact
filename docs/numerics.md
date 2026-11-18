@@ -64,6 +64,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
   - **v7** (decode, 4- and 8-bit, and unquantized): each output row split over many lanes, see *Speed* below;
   - **v7_rows** (2–4 rows, e.g. speculative verification): v7 that dequantizes each weight once for all rows;
   - **v4** (4 or more rows): MLX's own accelerator implementation (vendored) run with a 16-row tile, exact by construction;
+  - **dense v4** (unquantized, 5 or more rows): MLX's own dense accelerator GEMM loop (`gemm_loop`, vendored) with a 16-row tile, or with stock's own 128-row tile above 64 rows. The K order of an output element does not depend on the tile height, so this is the canonical arithmetic for every row count;
   - expert-indexed variants for MoE (v0 and v7 designs; each row reads its own expert's weights), and dense variants without dequantization.
 - **Attention.**
   - Query blocks below the accelerator threshold are padded to 9 queries, or 16 for head dims 192/256. The real queries go last under a causal, bottom-aligned mask. If the context is shorter than the padding, a square problem with zero keys (always masked) is used instead.
@@ -92,10 +93,12 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
 | speculative decoding (Qwen3-1.7B-4bit + 0.6B-4bit draft) | 0.78× of stock (k = 2), 0.83× (k = 4); before multi-row kernels 0.63–0.70× |
 | chunked prefill (Qwen3-1.7B-4bit, 512 tokens) | 1.78× / 1.38× / 1.43× of stock for chunks of 16 / 64 / 128; 1.00× in one chunk |
 | MoE decode-like step (8 rows, 128 experts, 4-bit, Qwen3-30B-A3B shapes; kernel time) | 110 µs vs stock 125 µs (previous exact kernel 136 µs) |
+| chunked prefill, unquantized (Qwen3.5-0.8B bf16, 512 tokens) | 0.78× / 0.73× / 0.94× / 0.98× of stock for chunks of 16 / 64 / 128 / 512 (before dense v4: 0.13–0.44×) |
 
 ## 6. Pitfalls found along the way
 - mlx-lm's `quantized_scaled_dot_product_attention` scales its `queries` argument with `*=`, which updates the caller's array object in place. Inside a model this is harmless, but a test that reuses the same query array across calls silently feeds pre-scaled queries to later calls (it cost us a false alarm).
 - `mx.fast.metal_kernel` passes very small inputs in Metal's `constant` address space, so kernels should declare input-derived pointers with `auto`.
+- `mx.fast.metal_kernel` appends the generated `template <...>` line directly after the `header` string, so a header whose last line is a `//` comment must end with a newline, or the comment swallows the template line.
 - Every distinct value of a `metal_kernel` template parameter compiles a new kernel variant (about 0.2 s for a large header). Sizes that vary from call to call, such as the row count of a chunk or batch, should be runtime inputs.
 - Agreement between two schedules shows only consistency. Every self-defined route must also be checked against an independent reference (here fp64 and MLX's own canonical kernels).
 - MLX seeds its default random generator from the clock (`mlx/random.h`), so anything random created before `mx.random.seed(...)`, such as LoRA's `lora_a` in `linear_to_lora_layers`, differs between runs. Seed first if the numbers should repeat.
