@@ -11,19 +11,33 @@ import mlx.core as mx
 from .kernels import qkv_attention_exact
 
 STATS = {}
+_WARNED = set()
+
+
+def _warn_once_attn(key, msg):
+    if key not in _WARNED:
+        _WARNED.add(key)
+        import warnings
+        warnings.warn("mlx_exact: " + msg)
 
 
 def _align_left_padding(keys, values, mask):
     """Batched left padding shifts a sequence's keys relative to the attention kernel's fixed KV blocks and 16-key
     fragments (aligned to key index 0), which changes the summation order (FINDINGS F14). Re-align every sequence so its
-    first valid key sits at index 0: shift K, V and the mask columns left by the sequence's padding (first valid key in
-    the last query row), filling the tail with zeros / masked entries. On device, no host sync."""
+    first valid key sits at index 0: shift K, V and the mask columns left, filling the tail with zeros / masked entries.
+    The shift is the smallest first-valid key index over all query rows and heads (rows with no valid key excluded).
+    Every row's valid keys lie at or after it, so shifting keys and mask together never changes any row's result: for
+    left padding it equals the padding, for sliding-window and other masks it is at most the earliest valid key.
+    Boolean masks only. On device, no host sync."""
     B, Hk, kL, Dk = keys.shape
     m = mask
     if m.ndim < 4:
         m = m.reshape((1,) * (4 - m.ndim) + m.shape)
-    last = m[:, :1, -1, :] if m.shape[0] == B else mx.broadcast_to(m[:, :1, -1, :], (B, 1, kL))
-    pad = mx.argmax(last.astype(mx.int32), axis=-1).reshape(B, 1, 1, 1)                     # first valid key
+    mb4 = m if m.shape[0] == B else mx.broadcast_to(m, (B,) + tuple(m.shape[1:]))
+    has = mx.any(mb4, axis=-1)                                                   # (B, Hm, Lq): row has a valid key
+    fv = mx.where(has, mx.argmax(mb4.astype(mx.int32), axis=-1), kL)             # first valid key per row
+    pad = mx.min(fv.reshape(B, -1), axis=-1)
+    pad = mx.where(pad >= kL, 0, pad).reshape(B, 1, 1, 1)
     j = mx.arange(kL).reshape(1, 1, 1, kL)
     src = j + pad
     valid = src < kL
@@ -51,6 +65,13 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
     L = queries.shape[2]
     D = queries.shape[3]
     if mask is not None and not isinstance(mask, str):
+        if mask.dtype != mx.bool_:
+            # additive (float) masks, e.g. DeepSeek-V3's MLA passes rotary score terms as the mask: no re-alignment or
+            # padding; stock attention keeps the values correct, but exactness is not guaranteed
+            _warn_once_attn("additive", "additive (non-boolean) attention masks are passed to stock attention; "
+                            "exactness is not guaranteed for these layers")
+            STATS["sdpa_additive_mask_stock"] = STATS.get("sdpa_additive_mask_stock", 0) + 1
+            return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask, sinks=sinks)
         keys, values, mask = _align_left_padding(keys, values, mask)
         STATS["sdpa_left_aligned"] = STATS.get("sdpa_left_aligned", 0) + 1
     # Head dims 192/256 take MLX's UNFUSED path for 9 <= qL < 1024 (separate dense matmuls; M <= 12 runs a gemv-like

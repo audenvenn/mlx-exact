@@ -100,6 +100,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
 - `mx.fast.metal_kernel` passes very small inputs in Metal's `constant` address space, so kernels should declare input-derived pointers with `auto`.
 - `mx.fast.metal_kernel` appends the generated `template <...>` line directly after the `header` string, so a header whose last line is a `//` comment must end with a newline, or the comment swallows the template line.
 - Every distinct value of a `metal_kernel` template parameter compiles a new kernel variant (about 0.2 s for a large header). Sizes that vary from call to call, such as the row count of a chunk or batch, should be runtime inputs.
+- An attention mask is not necessarily left padding. Re-aligning keys must shift by the earliest valid key over all query rows, which preserves every row's values; shifting by the last row's first valid key silently corrupts sliding-window layers (a bug in mlx-exact 0.1.0–0.5.2, found with the architecture sweep).
 - Agreement between two schedules shows only consistency. Every self-defined route must also be checked against an independent reference (here fp64 and MLX's own canonical kernels).
 - MLX seeds its default random generator from the clock (`mlx/random.h`), so anything random created before `mx.random.seed(...)`, such as LoRA's `lora_a` in `linear_to_lora_layers`, differs between runs. Seed first if the numbers should repeat.
 

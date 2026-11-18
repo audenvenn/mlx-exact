@@ -38,3 +38,67 @@ def test_left_padding_is_realigned(n):
         vp = mx.concatenate([_mk(rng, 1, 8, p, D), v], axis=2)
         m = mx.array(np.arange(n + p) >= p)[None, None, None, :]
         assert mx.array_equal(exact_sdpa(q, kp, vp, None, D ** -0.5, m), solo).item(), p
+
+
+def _window_mask(L, kL, window):
+    """Causal sliding-window boolean mask for L queries ending at key kL - 1."""
+    q = mx.arange(kL - L, kL).reshape(L, 1)
+    k = mx.arange(kL).reshape(1, kL)
+    return mx.logical_and(k <= q, k > q - window)
+
+
+@pytest.mark.parametrize("L", [1, 5, 17, 70])
+def test_realignment_preserves_values_for_any_boolean_mask(L):
+    """Regression (fixed in 0.5.3): re-alignment shifted keys by the LAST query row's first valid key, which drops
+    valid keys of earlier rows under a sliding-window mask. Exact attention must give stock's values (up to rounding)."""
+    from mlx_exact.attention import exact_sdpa
+    rng = np.random.default_rng(L)
+    kL, H, D = 70, 4, 64
+    q = mx.array(rng.standard_normal((1, H, L, D)).astype(np.float32)).astype(mx.bfloat16)
+    k = mx.array(rng.standard_normal((1, H, kL, D)).astype(np.float32)).astype(mx.bfloat16)
+    v = mx.array(rng.standard_normal((1, H, kL, D)).astype(np.float32)).astype(mx.bfloat16)
+    m = _window_mask(L, kL, 32)
+    ours = exact_sdpa(q, k, v, None, D ** -0.5, m).astype(mx.float32)
+    ref = mx.fast.scaled_dot_product_attention(q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32),
+                                               scale=D ** -0.5, mask=m)
+    assert float(mx.max(mx.abs(ours - ref)).item()) < 3e-2
+
+
+def test_additive_masks_pass_through_with_warning():
+    import warnings
+    from mlx_exact import attention
+    rng = np.random.default_rng(1)
+    q = mx.array(rng.standard_normal((1, 2, 3, 64)).astype(np.float32)).astype(mx.bfloat16)
+    k = mx.array(rng.standard_normal((1, 2, 20, 64)).astype(np.float32)).astype(mx.bfloat16)
+    add = mx.array(rng.standard_normal((1, 2, 3, 20)).astype(np.float32)).astype(mx.bfloat16)
+    attention._WARNED.discard("additive")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        ours = attention.exact_sdpa(q, k, k, None, 0.125, add)
+    assert any("additive" in str(r.message) for r in rec)
+    assert mx.array_equal(ours, mx.fast.scaled_dot_product_attention(q, k, k, scale=0.125, mask=add)).item()
+
+
+def test_sliding_window_model_values_match_stock():
+    """A sliding-window model (gemma3_text, random weights, window 32): exact mode gives stock's values up to
+    rounding, and decode is bit-identical to full prefill while the window has not filled."""
+    from mlx_lm.models import gemma3_text
+    from mlx_lm.models.cache import make_prompt_cache
+    import mlx_exact
+    cfg = dict(model_type="gemma3_text", hidden_size=256, num_hidden_layers=2, intermediate_size=512,
+               num_attention_heads=4, num_key_value_heads=2, head_dim=64, rms_norm_eps=1e-6, vocab_size=1024,
+               query_pre_attn_scalar=64, sliding_window=32, sliding_window_pattern=2, max_position_embeddings=2048)
+    mx.random.seed(1)
+    model = gemma3_text.Model(gemma3_text.ModelArgs.from_dict(cfg))
+    model.set_dtype(mx.bfloat16)
+    ids = np.random.default_rng(0).integers(0, 1024, 70).tolist()
+    stock = model(mx.array(ids)[None])[0].astype(mx.float32)
+    mlx_exact.enable()
+    try:
+        full = model(mx.array(ids)[None])[0]
+        assert float(mx.max(mx.abs(full.astype(mx.float32) - stock)).item()) < 0.15
+        cache = make_prompt_cache(model)
+        for t in range(32):
+            assert mx.array_equal(model(mx.array(ids[t:t + 1])[None], cache=cache)[0, -1], full[t]).item(), t
+    finally:
+        mlx_exact.disable()
