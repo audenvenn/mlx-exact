@@ -745,3 +745,89 @@ def qmv_exact_v7_rows(x, w, scales, biases, group_size=64, bits=4):
                             grid=(((N + 7) // 8) * 96, 1, 1), threadgroup=(96, 1, 1),
                             output_shapes=[(M, N)], output_dtypes=[x.dtype])[0]
     return y.reshape(*lead, N)
+
+
+# gather v7: the v7 design for MoE expert layers; x row m uses expert idx[m]. Same arithmetic as MLX's canonical sorted
+# expert kernel (gather_qmm_rhs on accelerator devices), 4- and 8-bit.
+_SRC_GATHER_EXACT_V7 = r"""    // DQ: round the dequantized fp32 value to T, as MLX's loader does (static_cast<T>), and widen back to float
+    #define DQ(v) float(static_cast<T>(v))
+
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint n0 = threadgroup_position_in_grid.x * 32;
+    const uint m = threadgroup_position_in_grid.y;
+    const size_t eoff = size_t(idx[m]) * N_OUT;      // this row's expert
+    const uint hf = lane / 16;
+    const uint chunk = lane % 16;
+    constexpr int NT = K_IN / 256;
+    constexpr int PER_WORD = 32 / BITS;
+    constexpr int WPC = 16 / PER_WORD;
+    constexpr int BUF = 4 * 16 * 33;
+    threadgroup float qs[2 * BUF];
+    auto xr = x + size_t(m) * K_IN;
+    float acc = 0.0f;
+    for (int kb = 0; kb <= NT; kb++) {
+        if (sg < P) {
+            if (kb < NT) {
+                threadgroup float* q = qs + (kb & 1) * BUF;
+                const int k0 = kb * 256 + int(chunk) * 16;
+                float xs[16];
+                for (int i = 0; i < 16; i++) {
+                    xs[i] = float(xr[k0 + i]);
+                }
+                for (int p = 0; p < 16 / P; p++) {
+                    const uint rl = (sg * (16 / P) + p) * 2 + hf;
+                    const uint n = min(n0 + rl, uint(N_OUT - 1));
+                    const size_t wi = (eoff + n) * (K_IN / PER_WORD) + k0 / PER_WORD;
+                    uint32_t ww[WPC];
+                    for (int j = 0; j < WPC; j++) {
+                        ww[j] = w[wi + j];
+                    }
+                    const float s = float(scales[(eoff + n) * (K_IN / 64) + k0 / 64]);
+                    const float b = float(biases[(eoff + n) * (K_IN / 64) + k0 / 64]);
+                    float wv[16];
+                    for (int i = 0; i < 16; i++) {
+                        wv[i] = DQ(fma(s, float(extract_bits(ww[i / PER_WORD], uint(BITS * (i % PER_WORD)), uint(BITS))), b));
+                    }
+                    // products are exact in fp32, so fma(a, b, c * d) == round(a * b + c * d): same bits as the
+                    // canonical pair sum p[2r] + p[2r+1]
+                    for (int r = 0; r < 4; r++) {
+                        const float pa = fma(wv[2 * r], xs[2 * r], wv[2 * r + 1] * xs[2 * r + 1]);
+                        const float pb = fma(wv[2 * r + 8], xs[2 * r + 8], wv[2 * r + 9] * xs[2 * r + 9]);
+                        q[(r * 16 + chunk) * 33 + rl] = pa + pb;
+                    }
+                }
+            }
+        } else if (kb > 0) {
+            threadgroup const float* q = qs + ((kb - 1) & 1) * BUF;
+            for (int c = 0; c < 16; c++) {
+                for (int r = 0; r < 4; r++) {
+                    acc = acc + q[(r * 16 + c) * 33 + lane];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg == P && n0 + lane < N_OUT) {
+        out[size_t(m) * N_OUT + n0 + lane] = static_cast<T>(acc);
+    }
+"""
+
+
+def gather_qmv_exact_v7(x, w, scales, biases, idx, group_size=64, bits=4, producers=8):
+    """x: [B, K] rows; w: [E, N, K*bits/32] uint32; scales, biases: [E, N, K/64]; idx: [B] expert per row -> [B, N].
+    4- or 8-bit affine, group 64, K % 256 == 0; canonical arithmetic."""
+    assert bits in (4, 8) and group_size == 64 and producers in (2, 4, 8)
+    E, N, kp = w.shape
+    K = kp * (32 // bits)
+    assert K % 256 == 0 and x.shape[-1] == K
+    B = x.shape[0]
+    if "gather_v7" not in _kernels:
+        _kernels["gather_v7"] = mx.fast.metal_kernel(
+            name="mlx_exact_gather_v7", input_names=["x", "w", "scales", "biases", "idx"], output_names=["out"],
+            source=_SRC_GATHER_EXACT_V7, compile_options={"math_mode": "safe"})
+    tg = (producers + 1) * 32
+    return _kernels["gather_v7"](inputs=[x, w, scales, biases, idx.reshape(-1).astype(mx.uint32)],
+                                 template=[("T", x.dtype), ("N_OUT", N), ("K_IN", K), ("P", producers), ("BITS", bits)],
+                                 grid=(((N + 31) // 32) * tg, B, 1), threadgroup=(tg, 1, 1),
+                                 output_shapes=[(B, N)], output_dtypes=[x.dtype])[0]

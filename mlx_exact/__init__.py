@@ -20,11 +20,11 @@ import mlx.nn as nn
 from .attention import STATS as _ATT_STATS
 from .attention import exact_sdpa
 from .dispatch import CANONICAL, dense_stock_path, stock_qmm_path
-from .kernels import (dense_exact, dense_exact_v7, fp32_seq_matmul, gather_qmv_nax_exact, qmv_exact_bits,
-                      qmv_exact_v7, qmv_exact_v7_rows, qmv_nax_exact)
+from .kernels import (dense_exact, dense_exact_v7, fp32_seq_matmul, gather_qmv_exact_v7, gather_qmv_nax_exact,
+                      qmv_exact_bits, qmv_exact_v7, qmv_exact_v7_rows, qmv_nax_exact)
 from .nax_kernel import qmm_nax_exact_v4
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}
@@ -115,8 +115,8 @@ def gather_quantized_matmul(x, w, scales, biases, indices, sorted_indices=False,
     B = 1
     for d in batch:
         B *= d
-    if (bits != 4 or group_size != 64 or mode != "affine" or K % 64 != 0 or biases is None
-            or x.dtype not in (mx.bfloat16, mx.float16)):
+    if (bits not in (4, 8) or group_size != 64 or mode != "affine" or K % 64 != 0 or biases is None
+            or x.dtype not in (mx.bfloat16, mx.float16) or (bits == 8 and K % 256 != 0)):
         _warn_once(("g", bits, group_size, mode, str(x.dtype)), f"unsupported expert quantization (bits={bits}, "
                    f"group={group_size}, mode={mode}, activations {x.dtype}); using stock MLX, exactness not guaranteed")
         _STATS["gather_unsupported"] = _STATS.get("gather_unsupported", 0) + 1
@@ -129,7 +129,11 @@ def gather_quantized_matmul(x, w, scales, biases, indices, sorted_indices=False,
     _STATS["gather_rerouted"] = _STATS.get("gather_rerouted", 0) + 1
     xr = mx.broadcast_to(x, (*batch, M, K)).reshape(-1, K)
     ir = mx.broadcast_to(mx.expand_dims(indices, -1), (*batch, M)).reshape(-1)
-    return gather_qmv_nax_exact(xr, w, scales, biases, ir, group_size, bits).reshape(*batch, M, N)
+    if K % 256 == 0:          # rows split over lanes (v7 design); same arithmetic as the one-thread-per-output kernel
+        y = gather_qmv_exact_v7(xr, w, scales, biases, ir, group_size, bits)
+    else:
+        y = gather_qmv_nax_exact(xr, w, scales, biases, ir, group_size, bits)
+    return y.reshape(*batch, M, N)
 
 
 # ---- differentiable wrappers: forward = exact routes; backward = stock ops (gradients need not be bit-exact, only the

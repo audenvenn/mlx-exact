@@ -64,7 +64,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
   - **v7** (decode, 4- and 8-bit, and unquantized): each output row split over many lanes, see *Speed* below;
   - **v7_rows** (2–4 rows, e.g. speculative verification): v7 that dequantizes each weight once for all rows;
   - **v4** (4 or more rows): MLX's own accelerator implementation (vendored) run with a 16-row tile, exact by construction;
-  - an expert-indexed variant for MoE, and a dense variant without dequantization.
+  - expert-indexed variants for MoE (v0 and v7 designs; each row reads its own expert's weights), and dense variants without dequantization.
 - **Attention.**
   - Query blocks below the accelerator threshold are padded to 9 queries, or 16 for head dims 192/256. The real queries go last under a causal, bottom-aligned mask. If the context is shorter than the padding, a square problem with zero keys (always masked) is used instead.
   - Blocks of ≥ 1024 queries for head dims 192/256 are split below MLX's fused-kernel threshold.
@@ -91,6 +91,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
 | decode throughput (mlx-lm `generate_step`) | 0.93× of stock (Qwen3-0.6B-4bit: 306 vs 330 tok/s; Qwen3-1.7B-4bit: 126 vs 136), 0.97× (Qwen3-0.6B-8bit), 0.94× (Qwen3.5-0.8B-4bit), 0.98× (Qwen3.5-0.8B bf16). Before v7: 0.68–0.79× |
 | speculative decoding (Qwen3-1.7B-4bit + 0.6B-4bit draft) | 0.78× of stock (k = 2), 0.83× (k = 4); before multi-row kernels 0.63–0.70× |
 | chunked prefill (Qwen3-1.7B-4bit, 512 tokens) | 1.78× / 1.38× / 1.43× of stock for chunks of 16 / 64 / 128; 1.00× in one chunk |
+| MoE decode-like step (8 rows, 128 experts, 4-bit, Qwen3-30B-A3B shapes; kernel time) | 110 µs vs stock 125 µs (previous exact kernel 136 µs) |
 
 ## 6. Pitfalls found along the way
 - mlx-lm's `quantized_scaled_dot_product_attention` scales its `queries` argument with `*=`, which updates the caller's array object in place. Inside a model this is harmless, but a test that reuses the same query array across calls silently feeds pre-scaled queries to later calls (it cost us a false alarm).

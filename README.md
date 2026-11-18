@@ -67,9 +67,9 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 ## Limitations
 - **Validated environment:** MLX 0.32.4 on Apple M6 (GPU architecture generation 18). `enable()` refuses other environments unless `force=True`, because the kernel-dispatch replica is version- and chip-specific.
 - **Weights and activations:** unquantized bf16/fp16, or 4- and 8-bit affine quantization with group size 64; bf16 or fp16 activations. Other formats, and fp32 activations, fall back to stock MLX with a warning, and exactness is then not guaranteed.
-- **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), 8-bit MoE experts, attention sinks combined with a quantized KV cache, and models that call `mx.fast.scaled_dot_product_attention` directly instead of mlx-lm's `scaled_dot_product_attention`.
-- **MoE expert layers** (`QuantizedSwitchLinear` → `gather_qmm`) are supported. MLX's own sorted expert kernel equals the exact kernel per expert, bit for bit.
-- **Speed:** end-to-end decode runs at 0.93–0.98× of stock on the models above (Apple M6), speculative decoding at 0.78–0.83×, and chunked prefill (chunks of 16–128 tokens) at 1.4–1.8× of stock: for those sizes MLX's own accelerator kernel with a 16-row tile, which mlx-exact runs, is faster than the kernels stock MLX picks. One-shot prefills run at stock speed. A decode step is a chain of dependent matmuls, so each kernel's latency matters more than its throughput. The decode kernels split every output row over many lanes, and keep the canonical summation order with a per-row chain of fp32 additions ([docs/numerics.md](docs/numerics.md), section 4). Remaining slow paths: MoE expert layers (one thread per output), and unquantized layers with more than 4 rows.
+- **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), attention sinks combined with a quantized KV cache, and models that call `mx.fast.scaled_dot_product_attention` directly instead of mlx-lm's `scaled_dot_product_attention`.
+- **MoE expert layers** (`QuantizedSwitchLinear` → `gather_qmm`, 4- and 8-bit) are supported. MLX's own sorted expert kernel equals the exact kernel per expert, bit for bit. On a decode-like step with Qwen3-30B-A3B shapes (8 rows, 128 experts, 4-bit), the exact expert kernel takes 110 µs vs stock's 125 µs (kernel time; no large MoE model was run end to end).
+- **Speed:** end-to-end decode runs at 0.93–0.98× of stock on the models above (Apple M6), speculative decoding at 0.78–0.83×, and chunked prefill (chunks of 16–128 tokens) at 1.4–1.8× of stock: for those sizes MLX's own accelerator kernel with a 16-row tile, which mlx-exact runs, is faster than the kernels stock MLX picks. One-shot prefills run at stock speed. A decode step is a chain of dependent matmuls, so each kernel's latency matters more than its throughput. The decode kernels split every output row over many lanes, and keep the canonical summation order with a per-row chain of fp32 additions ([docs/numerics.md](docs/numerics.md), section 4). Remaining slow paths: unquantized layers with more than 4 rows, and MoE prefill chunks too small for MLX's sorted expert kernel (they use the per-row expert kernel).
 - **Accuracy:** the canonical arithmetic is that of MLX's prefill. Its per-matmul error is slightly higher than stock decode's because of the bf16 weight rounding, which is negligible next to 4-bit quantization error.
 
 ## Tests
@@ -77,7 +77,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - the kernels against MLX's prefill and MoE kernels;
 - attention against prefill rows, and left-padding re-alignment;
 - the dense kernel against MLX's canonical GEMM;
-- decode == prefill end to end on a small random-weight MoE model (no download);
+- decode == prefill end to end on small random-weight MoE models, 4- and 8-bit (no download);
 - with LoRA, sampler log-probs == trainer log-probs, and gradients flow, on a small random-weight model (no download);
 - decode == prefill on `mlx-community/Qwen3-0.6B-4bit`, if it is in the local Hugging Face cache.
 - the quantized KV cache: invariance, accuracy against an fp64 reference, and decode == prefill on a small random-weight model;
