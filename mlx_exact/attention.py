@@ -8,7 +8,7 @@ long prefills, whatever the number of queries in the call, the context length or
 """
 import mlx.core as mx
 
-from .kernels import qkv_attention_exact
+from .kernels import dense_attention_exact, qkv_attention_exact
 
 STATS = {}
 _WARNED = set()
@@ -102,6 +102,16 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         return qkv_attention_exact(queries, keys, values, scale, mask, cache.group_size, cache.bits)
     L = queries.shape[2]
     D = queries.shape[3]
+    if (D in (192, 256) and keys.shape[1] == 1 and sinks is None
+            and (mask is None or isinstance(mask, str) or mask.dtype == mx.bool_)):
+        # For these head dims MLX attends with an unfused path whose internal kernels depend on the query and key
+        # counts; with a single KV head that is not consistent across schedules (FINDINGS F30). mlx-exact's own
+        # fixed-order attention depends only on the order of the valid keys (masked keys contribute exact zeros), so it
+        # needs no padding or re-alignment, only temporal order for a rotating cache. Slower prefill than MLX's.
+        if _is_rotating(cache, keys):
+            keys, values, mask = _rotating_to_absolute(keys, values, mask, cache, L)
+        STATS["sdpa_fixed_order"] = STATS.get("sdpa_fixed_order", 0) + 1
+        return dense_attention_exact(queries, keys, values, scale, mask)
     rotating = _is_rotating(cache, keys) and (mask is None or isinstance(mask, str) or mask.dtype == mx.bool_)
     if rotating:
         keys, values, mask = _rotating_to_absolute(keys, values, mask, cache, L)

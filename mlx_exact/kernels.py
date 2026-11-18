@@ -416,7 +416,9 @@ _SRC_QKV_SCORES = r"""
     const uint j = thread_position_in_grid.x;            // key index
     const uint l = thread_position_in_grid.y;            // query index
     const uint bh = thread_position_in_grid.z;           // b * HQ + h
-    if (j >= KL) { return; }
+    const int L = int(dims[0]);                           // runtime: no new kernel variant per decode step
+    const int KL = int(dims[1]);
+    if (int(j) >= KL) { return; }
     const uint b = bh / HQ, h = bh % HQ, kvh = h / (HQ / HKV);
     constexpr int PER_WORD = 32 / BITS;
     constexpr uint MASK = (1u << BITS) - 1u;
@@ -438,7 +440,9 @@ _SRC_QKV_OUT = r"""
     const uint d = thread_position_in_grid.x;            // head-dim index
     const uint l = thread_position_in_grid.y;
     const uint bh = thread_position_in_grid.z;
-    if (d >= D) { return; }
+    const int L = int(dims[0]);
+    const int KL = int(dims[1]);
+    if (int(d) >= D) { return; }
     const uint b = bh / HQ, h = bh % HQ, kvh = h / (HQ / HKV);
     constexpr int PER_WORD = 32 / BITS;
     constexpr uint MASK = (1u << BITS) - 1u;
@@ -462,16 +466,16 @@ def qkv_attention_exact(queries, q_keys, q_values, scale, mask, group_size=64, b
     vq, vs, vb = q_values
     HKV, KL = kq.shape[1], kq.shape[2]
     q = (queries * scale)                                   # same scaling as mlx-lm (in the query dtype)
-    tmpl = [("T", queries.dtype), ("HQ", HQ), ("HKV", HKV), ("L", L), ("KL", KL), ("D", D), ("GS", group_size),
-            ("BITS", bits)]
+    tmpl = [("T", queries.dtype), ("HQ", HQ), ("HKV", HKV), ("D", D), ("GS", group_size), ("BITS", bits)]
+    dims = mx.array([L, KL], dtype=mx.int32)
     if "qkv_s" not in _kernels:
         _kernels["qkv_s"] = mx.fast.metal_kernel(
-            name="qkv_scores_exact", input_names=["q", "kq", "kscales", "kbiases"], output_names=["out"],
+            name="qkv_scores_exact", input_names=["q", "kq", "kscales", "kbiases", "dims"], output_names=["out"],
             source=_SRC_QKV_SCORES, compile_options={"math_mode": "safe"})
         _kernels["qkv_o"] = mx.fast.metal_kernel(
-            name="qkv_out_exact", input_names=["p", "vq", "vscales", "vbiases"], output_names=["out"],
+            name="qkv_out_exact", input_names=["p", "vq", "vscales", "vbiases", "dims"], output_names=["out"],
             source=_SRC_QKV_OUT, compile_options={"math_mode": "safe"})
-    scores = _kernels["qkv_s"](inputs=[q, kq, ks, kb], template=tmpl, grid=(KL, L, B * HQ),
+    scores = _kernels["qkv_s"](inputs=[q, kq, ks, kb, dims], template=tmpl, grid=(KL, L, B * HQ),
                                threadgroup=(min(256, KL), 1, 1), output_shapes=[(B, HQ, L, KL)],
                                output_dtypes=[queries.dtype])[0]
     if mask is not None:
@@ -484,7 +488,7 @@ def qkv_attention_exact(queries, q_keys, q_values, scale, mask, group_size=64, b
         else:
             scores = scores + mask
     p = mx.softmax(scores, axis=-1, precise=True)
-    return _kernels["qkv_o"](inputs=[p, vq, vs, vb], template=tmpl, grid=(D, L, B * HQ),
+    return _kernels["qkv_o"](inputs=[p, vq, vs, vb, dims], template=tmpl, grid=(D, L, B * HQ),
                              threadgroup=(min(256, D), 1, 1), output_shapes=[(B, HQ, L, D)],
                              output_dtypes=[queries.dtype])[0]
 
@@ -831,3 +835,92 @@ def gather_qmv_exact_v7(x, w, scales, biases, idx, group_size=64, bits=4, produc
                                  template=[("T", x.dtype), ("N_OUT", N), ("K_IN", K), ("P", producers), ("BITS", bits)],
                                  grid=(((N + 31) // 32) * tg, B, 1), threadgroup=(tg, 1, 1),
                                  output_shapes=[(B, N)], output_dtypes=[x.dtype])[0]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Fixed-order attention for dense K/V (for head dims where MLX's own attention is shape-dependent): scores (fp32
+# sequential fma over d, times scale), masked entries set to -inf, softmax with one thread per row (sequential max and
+# sum over keys in index order), output (fp32 sequential fma over keys). Masked keys contribute exact zeros, so the
+# result depends only on the order of the valid keys, not on their indices, the key count or the query count.
+# Query / key counts are runtime arguments (no recompilation per decode step).
+# ---------------------------------------------------------------------------------------------------------------------
+_SRC_DATT_SCORES = r"""
+    const uint j = thread_position_in_grid.x;
+    const uint l = thread_position_in_grid.y;
+    const uint bh = thread_position_in_grid.z;
+    const int L = int(dims[0]);
+    const int KL = int(dims[1]);
+    if (int(j) >= KL) { return; }
+    const uint b = bh / HQ, h = bh % HQ, kvh = h / (HQ / HKV);
+    auto qr = q + (size_t(bh) * L + l) * D;
+    auto kr = k + ((size_t(b) * HKV + kvh) * KL + j) * D;
+    float acc = 0.0f;
+    for (int d = 0; d < D; d++) {
+        acc = fma(float(qr[d]), float(kr[d]), acc);
+    }
+    out[(size_t(bh) * L + l) * KL + j] = acc * float(scale[0]);
+"""
+_SRC_DATT_SOFTMAX = r"""
+    const uint l = thread_position_in_grid.x;
+    const uint bh = thread_position_in_grid.y;
+    const int L = int(dims[0]);
+    const int KL = int(dims[1]);
+    if (int(l) >= L) { return; }
+    auto row = s + (size_t(bh) * L + l) * KL;
+    auto prow = out + (size_t(bh) * L + l) * KL;
+    float m = -INFINITY;
+    for (int j = 0; j < KL; j++) { m = max(m, float(row[j])); }
+    float sum = 0.0f;
+    for (int j = 0; j < KL; j++) {
+        const float e = (row[j] == -INFINITY) ? 0.0f : exp(float(row[j]) - m);
+        prow[j] = e;
+        sum += e;
+    }
+    const float inv = 1.0f / sum;
+    for (int j = 0; j < KL; j++) { prow[j] = prow[j] * inv; }
+"""
+_SRC_DATT_OUT = r"""
+    const uint d = thread_position_in_grid.x;
+    const uint l = thread_position_in_grid.y;
+    const uint bh = thread_position_in_grid.z;
+    const int L = int(dims[0]);
+    const int KL = int(dims[1]);
+    if (int(d) >= D) { return; }
+    const uint b = bh / HQ, h = bh % HQ, kvh = h / (HQ / HKV);
+    auto pr = p + (size_t(bh) * L + l) * KL;
+    auto vr = v + (size_t(b) * HKV + kvh) * size_t(KL) * D + d;
+    float acc = 0.0f;
+    for (int j = 0; j < KL; j++) {
+        acc = fma(pr[j], float(vr[size_t(j) * D]), acc);
+    }
+    out[(size_t(bh) * L + l) * D + d] = static_cast<T>(acc);
+"""
+
+
+def dense_attention_exact(queries, keys, values, scale, mask):
+    """queries [B, HQ, L, D]; keys / values [B, HKV, kL, D] (same dtype); mask None, "causal" (bottom-right aligned)
+    or boolean array broadcastable to [B, HQ, L, kL]. Fixed-order attention, independent of L and kL."""
+    B, HQ, L, D = queries.shape
+    HKV, KL = keys.shape[1], keys.shape[2]
+    dims = mx.array([L, KL], dtype=mx.int32)
+    if "datt_s" not in _kernels:
+        _kernels["datt_s"] = mx.fast.metal_kernel(name="mlx_exact_datt_scores", input_names=["q", "k", "dims", "scale"],
+                                                  output_names=["out"], source=_SRC_DATT_SCORES,
+                                                  compile_options={"math_mode": "safe"})
+        _kernels["datt_m"] = mx.fast.metal_kernel(name="mlx_exact_datt_softmax", input_names=["s", "dims"], output_names=["out"],
+                                                  source=_SRC_DATT_SOFTMAX, compile_options={"math_mode": "safe"})
+        _kernels["datt_o"] = mx.fast.metal_kernel(name="mlx_exact_datt_out", input_names=["p", "v", "dims"], output_names=["out"],
+                                                  source=_SRC_DATT_OUT, compile_options={"math_mode": "safe"})
+    tmpl = [("T", queries.dtype), ("HQ", HQ), ("HKV", HKV), ("D", D)]
+    s = _kernels["datt_s"](inputs=[queries, keys, dims, mx.array([scale], dtype=mx.float32)], template=tmpl,
+                           grid=(KL, L, B * HQ), threadgroup=(min(256, KL), 1, 1),
+                           output_shapes=[(B, HQ, L, KL)], output_dtypes=[mx.float32])[0]
+    if mask is not None:
+        if isinstance(mask, str):
+            mask = mx.arange(KL)[None, :] <= (mx.arange(L)[:, None] + KL - L)
+        s = mx.where(mask, s, -mx.inf)
+    p = _kernels["datt_m"](inputs=[s, dims], template=[("T", queries.dtype)], grid=(L, B * HQ, 1),
+                           threadgroup=(min(64, L), 1, 1), output_shapes=[(B, HQ, L, KL)], output_dtypes=[mx.float32])[0]
+    return _kernels["datt_o"](inputs=[p, values, dims], template=tmpl, grid=(D, L, B * HQ),
+                              threadgroup=(min(256, D), 1, 1), output_shapes=[(B, HQ, L, D)],
+                              output_dtypes=[queries.dtype])[0]

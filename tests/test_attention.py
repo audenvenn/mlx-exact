@@ -139,3 +139,46 @@ def test_sliding_window_models_are_bit_exact(arch, bits):
                     assert mx.array_equal(out[i], full[s0 + i]).item(), (arch, bits, c, s0 + i)
     finally:
         mlx_exact.disable()
+
+
+def test_fixed_order_attention_accuracy():
+    """mlx-exact's fixed-order attention (head dims 192/256 with one KV head) matches an fp32 reference to bf16 level."""
+    from mlx_exact.kernels import dense_attention_exact
+    rng = np.random.default_rng(0)
+    q = mx.array(rng.standard_normal((1, 4, 37, 256)).astype(np.float32)).astype(mx.bfloat16)
+    k = mx.array(rng.standard_normal((1, 1, 300, 256)).astype(np.float32)).astype(mx.bfloat16)
+    v = mx.array(rng.standard_normal((1, 1, 300, 256)).astype(np.float32)).astype(mx.bfloat16)
+    ref = mx.fast.scaled_dot_product_attention(q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32),
+                                               scale=0.0625, mask="causal")
+    ours = dense_attention_exact(q, k, v, 0.0625, "causal").astype(mx.float32)
+    assert float(mx.max(mx.abs(ours - ref)).item()) < 3e-3
+
+
+@pytest.mark.parametrize("bits", [None, 4])
+def test_single_kv_head_256_model_is_bit_exact(bits):
+    """Head dim 256 with one KV head (Gemma-3-1B-like), sliding window 32: decode and chunks equal full prefill."""
+    import mlx.nn as nn
+    from mlx_lm.models import gemma3_text
+    from mlx_lm.models.cache import make_prompt_cache
+    import mlx_exact
+    cfg = dict(model_type="gemma3_text", hidden_size=256, num_hidden_layers=2, intermediate_size=512,
+               num_attention_heads=2, num_key_value_heads=1, head_dim=256, rms_norm_eps=1e-6, vocab_size=1024,
+               rope_theta=10000.0, max_position_embeddings=4096, tie_word_embeddings=True, sliding_window=32,
+               sliding_window_pattern=2, query_pre_attn_scalar=256)
+    mx.random.seed(1)
+    model = gemma3_text.Model(gemma3_text.ModelArgs.from_dict(cfg))
+    model.set_dtype(mx.bfloat16)
+    if bits:
+        nn.quantize(model, group_size=64, bits=bits)
+    ids = np.random.default_rng(0).integers(0, 1024, 100).tolist()
+    mlx_exact.enable()
+    try:
+        full = model(mx.array(ids)[None])[0]
+        for c in (1, 3, 17, 40):
+            cache = make_prompt_cache(model)
+            for s0 in range(0, len(ids), c):
+                out = model(mx.array(ids[s0:s0 + c])[None], cache=cache)[0]
+                for i in range(out.shape[0]):
+                    assert mx.array_equal(out[i], full[s0 + i]).item(), (bits, c, s0 + i)
+    finally:
+        mlx_exact.disable()
