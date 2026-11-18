@@ -81,7 +81,7 @@ def test_additive_masks_pass_through_with_warning():
 
 def test_sliding_window_model_values_match_stock():
     """A sliding-window model (gemma3_text, random weights, window 32): exact mode gives stock's values up to
-    rounding, and decode is bit-identical to full prefill while the window has not filled."""
+    rounding, and decode is bit-identical to full prefill (here only the first 32 positions; see the next test)."""
     from mlx_lm.models import gemma3_text
     from mlx_lm.models.cache import make_prompt_cache
     import mlx_exact
@@ -100,5 +100,42 @@ def test_sliding_window_model_values_match_stock():
         cache = make_prompt_cache(model)
         for t in range(32):
             assert mx.array_equal(model(mx.array(ids[t:t + 1])[None], cache=cache)[0, -1], full[t]).item(), t
+    finally:
+        mlx_exact.disable()
+
+
+
+@pytest.mark.parametrize("arch,bits", [("gemma3_text", None), ("gemma3_text", 4), ("gpt_oss", 4)])
+def test_sliding_window_models_are_bit_exact(arch, bits):
+    """Rotating KV caches (sliding-window layers): the window is put in temporal order and aligned to MLX's 32-key
+    attention blocks, so decode and chunked prefill equal one full prefill at every position, also after the window
+    has filled and the ring buffer has wrapped. gpt_oss also uses attention sinks; its experts are quantized here
+    (unquantized MoE experts are not routed)."""
+    import importlib
+    import mlx.nn as nn
+    from mlx_lm.models.cache import make_prompt_cache
+    import mlx_exact
+    base = dict(hidden_size=256, num_hidden_layers=2, intermediate_size=512, num_attention_heads=4, num_key_value_heads=2,
+                head_dim=64, rms_norm_eps=1e-6, vocab_size=1024, rope_theta=10000.0, max_position_embeddings=2048,
+                tie_word_embeddings=True, model_type=arch)
+    extra = {"gemma3_text": dict(query_pre_attn_scalar=64, sliding_window=32, sliding_window_pattern=2),
+             "gpt_oss": dict(num_local_experts=8, num_experts_per_tok=2, sliding_window=32)}[arch]
+    mod = importlib.import_module(f"mlx_lm.models.{arch}")
+    mx.random.seed(1)
+    model = mod.Model(mod.ModelArgs.from_dict(dict(base, **extra)))
+    model.set_dtype(mx.bfloat16)
+    if bits:
+        nn.quantize(model, group_size=64, bits=bits,
+                    class_predicate=lambda p, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0)
+    ids = np.random.default_rng(0).integers(0, 1024, 100).tolist()
+    mlx_exact.enable()
+    try:
+        full = model(mx.array(ids)[None])[0]
+        for c in (1, 3, 17, 40):
+            cache = make_prompt_cache(model)
+            for s0 in range(0, len(ids), c):
+                out = model(mx.array(ids[s0:s0 + c])[None], cache=cache)[0]
+                for i in range(out.shape[0]):
+                    assert mx.array_equal(out[i], full[s0 + i]).item(), (arch, bits, c, s0 + i)
     finally:
         mlx_exact.disable()

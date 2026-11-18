@@ -52,6 +52,44 @@ def _align_left_padding(keys, values, mask):
     return k2.astype(keys.dtype), v2.astype(values.dtype), m2
 
 
+KV_BLOCK = 32       # key block of MLX's fused accelerator attention kernel (sdpa_full_self_attention_nax: bk = 32)
+
+
+def _is_rotating(cache, keys):
+    """mlx-lm RotatingKVCache (sliding-window layers), single sequence, no kept prefix."""
+    return (cache is not None and hasattr(cache, "max_size") and hasattr(cache, "_idx") and not hasattr(cache, "bits")
+            and getattr(cache, "keep", 0) == 0 and keys.shape[0] == 1)
+
+
+def _rotating_to_absolute(keys, values, mask, cache, L):
+    """A full prefill from position 0 has key position p at index p, so the attention kernel's 32-key blocks hold
+    absolute positions [32j, 32j + 32). A rotating cache returns its window starting at another position (chunked
+    prefill) and, once the ring buffer has wrapped, in rotated order (decode). Put the window in temporal order and
+    prepend (position of its first key) mod 32 zero keys, always masked, so every key sits at an index congruent to its
+    absolute position: the same block contents as in the full prefill. Masked keys contribute exact zeros."""
+    B, H, kL, Dk = keys.shape
+    if L == 1 and cache.offset > kL:
+        i = int(cache._idx) % kL                               # next write slot = oldest entry of the wrapped buffer
+        if i:
+            keys = mx.concatenate([keys[:, :, i:], keys[:, :, :i]], axis=2)
+            values = mx.concatenate([values[:, :, i:], values[:, :, :i]], axis=2)
+            if mask is not None and not isinstance(mask, str):  # an array mask is in buffer order too (max_size > window)
+                mask = mx.concatenate([mask[..., i:], mask[..., :i]], axis=-1)
+    r = (int(cache.offset) - kL) % KV_BLOCK
+    if r == 0:
+        return keys, values, mask
+    keys = mx.concatenate([mx.zeros((B, H, r, Dk), keys.dtype), keys], axis=2)
+    values = mx.concatenate([mx.zeros((B, values.shape[1], r, values.shape[3]), values.dtype), values], axis=2)
+    if mask is None:
+        m = mx.ones((1, 1, L, kL), mx.bool_)
+    elif isinstance(mask, str):                                # "causal", bottom-right aligned over the kL keys
+        m = (mx.arange(kL)[None, :] <= (mx.arange(L)[:, None] + kL - L)).reshape(1, 1, L, kL)
+    else:
+        m = mask if mask.ndim == 4 else mask.reshape((1,) * (4 - mask.ndim) + mask.shape)
+    m = mx.concatenate([mx.zeros((*m.shape[:-1], r), mx.bool_), m], axis=-1)
+    return keys, values, m
+
+
 def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
     """queries [B, Hq, L, D]. For L <= 8 pad to 9 rows (copies of the first row placed BEFORE the real rows) and use
     a causal mask, so MLX runs the full-attention kernel; return the last L rows."""
@@ -64,7 +102,11 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         return qkv_attention_exact(queries, keys, values, scale, mask, cache.group_size, cache.bits)
     L = queries.shape[2]
     D = queries.shape[3]
-    if mask is not None and not isinstance(mask, str):
+    rotating = _is_rotating(cache, keys) and (mask is None or isinstance(mask, str) or mask.dtype == mx.bool_)
+    if rotating:
+        keys, values, mask = _rotating_to_absolute(keys, values, mask, cache, L)
+        STATS["sdpa_rotating_aligned"] = STATS.get("sdpa_rotating_aligned", 0) + 1
+    if mask is not None and not isinstance(mask, str) and not rotating:
         if mask.dtype != mx.bool_:
             # additive (float) masks, e.g. DeepSeek-V3's MLA passes rotary score terms as the mask: no re-alignment or
             # padding; stock attention keeps the values correct, but exactness is not guaranteed

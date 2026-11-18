@@ -79,8 +79,13 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - **Validated environment:** MLX 0.32.4 on Apple M6 (GPU architecture generation 18). `enable()` refuses other environments unless `force=True`, because the kernel-dispatch replica is version- and chip-specific.
 - **Weights and activations:** unquantized bf16/fp16, or 4- and 8-bit affine quantization with group size 64; bf16 or fp16 activations. Other formats, and fp32 activations, fall back to stock MLX with a warning, and exactness is then not guaranteed.
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), attention sinks combined with a quantized KV cache, and models that call `mx.fast.scaled_dot_product_attention` directly instead of mlx-lm's `scaled_dot_product_attention`.
-- **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2, granite, glm4 and lfm2, as well as qwen3, qwen3_5 and qwen3_moe above.
-- **Sliding-window attention** (models with a rotating KV cache, e.g. Gemma 3, Cohere 2, EXAONE 4, gpt-oss): values are correct, but positions after the window has filled are not bit-exact across schedules, because decode keeps the window's keys in rotated order.
+- **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2, granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above.
+- **Sliding-window attention** (rotating KV cache: Gemma 3, Cohere 2, EXAONE 4, gpt-oss, …): bit-exact for a single sequence since 0.6.0. The window is put back in temporal order and aligned to the attention kernel's 32-key blocks, with at most 31 extra masked keys per step. Not covered:
+  - batched generation with sliding windows;
+  - caches with a kept prefix (`keep > 0`, e.g. mlx-lm's `--max-kv-size`);
+  - the head-dim case below.
+- **Head dims 192/256 with a single KV head** (e.g. Gemma 3 1B): MLX computes attention for these head dims with an unfused path whose internal kernels depend on the query and key counts. With one KV head the results are not consistent across schedules, so such models are not bit-exact (values correct). With two or more KV heads (Qwen3.5, Gemma-3-4B-like shapes) every tested schedule is bit-exact.
+- **Unquantized MoE expert layers** (`SwitchLinear` → `gather_mm`) are not rerouted; quantized experts are.
 - **Weights applied with raw matmuls** (`x @ w.T` instead of a linear or embedding layer) are not rerouted, so those products stay schedule-dependent. In mlx-lm 0.32.2 this applies to:
   - the MoE router gates of DeepSeek-V2/V3, GLM-4-MoE, dots1, EXAONE-MoE, MiMo-V2-Flash, Nemotron-H and Bailing-MoE-V3;
   - DeepSeek-V3's MLA projections;
@@ -106,6 +111,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above.
 
 ## Changes
+- **0.6.0:** sliding-window attention is bit-exact for single sequences (rotating KV caches: temporal order plus 32-key block alignment). The architecture sweep now passes for 16 mlx-lm architectures in bf16 and 4-bit; documented limits: single-KV-head models at head dim 192/256, unquantized MoE experts, batched sliding windows.
 - **0.5.3:** fixes wrong attention values in exact mode for sliding-window masks and additive masks (present since 0.1.0). Re-aligning keys for batched left padding shifted every query row by the last row's first valid key, which drops valid keys of earlier rows under a sliding window. The shift is now the earliest valid key over all rows and heads, which never changes a row's values, and additive masks are no longer shifted. Causal and left-padding masks, and therefore the results above, were not affected.
 
 ## License

@@ -70,6 +70,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
   - Query blocks below the accelerator threshold are padded to 9 queries, or 16 for head dims 192/256. The real queries go last under a causal, bottom-aligned mask. If the context is shorter than the padding, a square problem with zero keys (always masked) is used instead.
   - Blocks of ≥ 1024 queries for head dims 192/256 are split below MLX's fused-kernel threshold.
   - With a batch mask, each sequence's keys are first re-aligned to start at index 0.
+  - With a sliding window (rotating KV cache), the window is put in temporal order and r = (absolute position of its first key) mod 32 masked zero keys are prepended, so each key sits at the same position within the kernel's 32-key blocks as in a full prefill.
   - Masked keys contribute exact zeros, so this reproduces the canonical rows bit for bit.
 - **Paths that mlx-lm composes from several MLX ops** (quantized KV-cache attention, LoRA adapters) have no single MLX kernel to take as canonical, so mlx-exact defines the arithmetic itself: fixed-order fp32 kernels that are identical for every query or row count. Checked against fp64, the quantized-KV attention is as accurate as stock decode, and the LoRA kernel is accurate to fp32 rounding.
 - **Gradients.** Every exact route is an `mx.custom_function` whose backward pass uses stock MLX ops. Gradients need not be bit-exact; only the forward must match, e.g. the sampler's and the trainer's log-probabilities.
