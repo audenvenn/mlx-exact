@@ -10,6 +10,16 @@ In stock MLX, a token's logits depend on how the computation was scheduled. Full
 
 `mlx_exact.enable()` makes every schedule compute the same function, bit for bit. Long prefills keep MLX's neural-accelerator speed.
 
+## Install
+Requires an Apple M5/M6 Mac (validated on M6), Python ≥ 3.10, and MLX 0.32.4 exactly, which is installed as a dependency. mlx-lm comes with the `lm` extra; validated with 0.32.2.
+
+```bash
+pip install "mlx-exact[lm] @ git+https://github.com/audenvenn/mlx-exact"
+```
+
+To run the tests and the reproduction scripts, use a clone instead: `git clone https://github.com/audenvenn/mlx-exact && cd mlx-exact && pip install -e ".[test]"`.
+
+## Usage
 ```python
 import mlx_exact
 from mlx_lm import load, generate

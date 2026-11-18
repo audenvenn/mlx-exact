@@ -104,7 +104,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
 - MLX seeds its default random generator from the clock (`mlx/random.h`), so anything random created before `mx.random.seed(...)`, such as LoRA's `lora_a` in `linear_to_lora_layers`, differs between runs. Seed first if the numbers should repeat.
 
 ## 7. Reproducing
-`pip install -e .`, then run the scripts in `experiments/`. Each runs the same workload in stock MLX and with mlx-exact in one process. The models (`mlx-community/Qwen3-0.6B-4bit`, `Qwen3-1.7B-4bit`) are downloaded from Hugging Face on first use. Output on an Apple M6, MLX 0.32.4, mlx-lm 0.32.2:
+From a clone, `pip install -e ".[lm]"`, then run the scripts in `experiments/`. Each runs the same workload in stock MLX and with mlx-exact in one process. The models (`mlx-community/Qwen3-0.6B-4bit`, `Qwen3-1.7B-4bit`) are downloaded from Hugging Face on first use. Output on an Apple M6, MLX 0.32.4, mlx-lm 0.32.2:
 
 **`order_scan.py`** (under a second): the survival patterns for `gemv` and the accelerator GEMM (e.g. with −B at 127, only positions 118, 119 and 126 survive on the accelerator, the last quad), then:
 ```
