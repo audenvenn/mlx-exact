@@ -32,6 +32,13 @@ print(mlx_exact.stats())               # which kernels stock MLX would have used
 
 ## Results (Apple M6, MLX 0.32.4, mlx-lm 0.32.2)
 
+**Why it matters, on a benchmark:** GSM8K, first 100 test problems, Qwen3-1.7B-4bit, greedy.
+- In stock MLX, prefilling the prompt in chunks of 16 tokens instead of all at once changed 67 of the 100 generated solutions and **18 of the 100 final answers**, and accuracy moved from 75% to 80%.
+- Batched generation (8 per batch) changed 14 answers.
+- The flips go both ways (McNemar p = 0.18), so the accuracy gap is scheduling noise, not an effect.
+- With mlx-exact every schedule gives the same 100 answers (accuracy 80% throughout), at 0.88× of the stock wall time.
+
+
 | Test | Stock MLX | With mlx-exact |
 |---|---|---|
 | Qwen3-0.6B-4bit, 360-token prompt: decode / chunks of 4–100 vs full prefill | 0 / 360 positions bit-identical | 360 / 360 |
@@ -79,7 +86,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - **Validated environment:** MLX 0.32.4 on Apple M6 (GPU architecture generation 18). `enable()` refuses other environments unless `force=True`, because the kernel-dispatch replica is version- and chip-specific.
 - **Weights and activations:** unquantized bf16/fp16, or 4- and 8-bit affine quantization with group size 64; bf16 or fp16 activations. Other formats, and fp32 activations, fall back to stock MLX with a warning, and exactness is then not guaranteed.
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), attention sinks combined with a quantized KV cache, and models that call `mx.fast.scaled_dot_product_attention` directly instead of mlx-lm's `scaled_dot_product_attention`.
-- **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2, granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above.
+- **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2, granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above. gpt_oss was tested with affine-quantized experts; released gpt-oss checkpoints use mxfp4 experts, which mlx-exact does not support (they fall back to stock with a warning).
 - **Sliding-window attention** (rotating KV cache: Gemma 3, Cohere 2, EXAONE 4, gpt-oss, …): bit-exact for a single sequence since 0.6.0. The window is put back in temporal order and aligned to the attention kernel's 32-key blocks, with at most 31 extra masked keys per step. Not covered:
   - batched generation with sliding windows;
   - caches with a kept prefix (`keep > 0`, e.g. mlx-lm's `--max-kv-size`);
