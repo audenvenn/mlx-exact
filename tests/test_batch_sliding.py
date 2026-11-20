@@ -17,6 +17,7 @@ CFG = {
     "exaone4": dict(rope_scaling=None, sliding_window=32, sliding_window_pattern="LG"),
     "gemma3_text_d256_1kv": dict(model_type="gemma3_text", head_dim=256, num_key_value_heads=1,
                                  query_pre_attn_scalar=256, sliding_window=32, sliding_window_pattern=2),
+    "gpt_oss": dict(num_local_experts=8, num_experts_per_tok=2, sliding_window=32),     # attention sinks
 }
 
 
@@ -25,12 +26,7 @@ def test_batched_sliding_window_generation_equals_each_prompt_alone(name):
     from mlx_lm.generate import BatchGenerator, generate_step
     from mlx_lm.sample_utils import make_sampler
     import mlx_exact
-    extra = dict(CFG[name])
-    arch = extra.pop("model_type", name)
-    mod = importlib.import_module(f"mlx_lm.models.{arch}")
-    mx.random.seed(1)
-    model = mod.Model(mod.ModelArgs.from_dict(dict(BASE, model_type=arch, **extra)))
-    model.set_dtype(mx.bfloat16)
+    model = _model(name)
     rng = np.random.default_rng(0)
     prompts = [rng.integers(0, 1024, n).tolist() for n in (20, 45, 70)]    # shorter and longer than the window
     N = 40
@@ -65,6 +61,10 @@ def _model(name):
     mx.random.seed(1)
     model = mod.Model(mod.ModelArgs.from_dict(dict(BASE, model_type=arch, **extra)))
     model.set_dtype(mx.bfloat16)
+    if arch == "gpt_oss":                           # quantized experts (unquantized ones are not rerouted)
+        import mlx.nn as nn
+        from mlx_lm.models.switch_layers import SwitchLinear
+        nn.quantize(model, group_size=32, bits=4, mode="mxfp4", class_predicate=lambda p, m: isinstance(m, SwitchLinear))
     return model
 
 

@@ -95,9 +95,9 @@ _SRC = r"""
     mp.M_strides[0] = (mask_shape[0] == 1) ? 0 : mask_strides[0];
     mp.M_strides[1] = (mask_shape[1] == 1) ? 0 : mask_strides[1];
     mp.M_strides[2] = (mask_shape[2] == 1) ? 0 : mask_strides[2];
-    attention_nax_impl<T, BQ, BK, BD, BD, WM, 1, bool, float, false, false, HAS_MASK, DO_CAUSAL, false, false>(
+    attention_nax_impl<T, BQ, BK, BD, BD, WM, 1, bool, float, false, false, HAS_MASK, DO_CAUSAL, HAS_SINKS, false>(
         queries, keys + int64_t(off) * keys_strides[2], values + int64_t(off) * values_strides[2], out, &p, &mp,
-        mask + (HAS_MASK ? off : 0), queries, reinterpret_cast<device float*>(out), thread_index_in_simdgroup,
+        mask + (HAS_MASK ? off : 0), sinks, reinterpret_cast<device float*>(out), thread_index_in_simdgroup,
         simdgroup_index_in_threadgroup, threadgroup_position_in_grid, thread_position_in_threadgroup);
 """
 
@@ -114,13 +114,14 @@ def _dummy_mask():
 def _kernel():
     if "attn" not in _KERNELS:
         _KERNELS["attn"] = mx.fast.metal_kernel(
-            name="mlx_exact_attention_nax_offsets", input_names=["queries", "keys", "values", "mask", "pads", "scale"],
+            name="mlx_exact_attention_nax_offsets", input_names=["queries", "keys", "values", "mask", "pads", "scale",
+                                                                 "sinks"],
             output_names=["out"], source=_SRC, header=_attn_header(), ensure_row_contiguous=False)
     return _KERNELS["attn"]
 
 
 def attention_offsets(queries, keys, values, scale, mask=None, pads=None, causal=False, kv_inplace=False, wm=None,
-                      pack=None):
+                      pack=None, sinks=None):
     """MLX's accelerator attention with per-sequence key offsets.
     - queries [B, Hq, L, D]; keys, values [B, Hkv, kL, D]; D in HEAD_DIMS; one dtype, bf16 or fp16.
     - mask: None or boolean, broadcastable to [B, Hq, L, kL]. causal (no array mask): bottom-right aligned over each
@@ -131,6 +132,8 @@ def attention_offsets(queries, keys, values, scale, mask=None, pads=None, causal
     - kv_inplace: keys / values are KV-cache slices whose last dimension is contiguous (mlx-lm caches); they are read
       in place, whatever their outer strides. Otherwise they are made contiguous first (a copy only if they are not).
       Queries and the mask are always made contiguous (no copy if they already are).
+    - sinks: None or [Hq] (one attention-sink logit per query head, as in gpt-oss), cast to the query dtype as MLX
+      does; the kernel seeds each row's running maximum with it and its running sum with 1.
     - Rows without any valid key get unspecified, finite values.
     - wm / pack override the tile choice (tests only)."""
     if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4:
@@ -165,20 +168,29 @@ def attention_offsets(queries, keys, values, scale, mask=None, pads=None, causal
             m = mx.concatenate([m, mx.zeros(tuple(m.shape[:-1]) + (8,), mx.bool_)], axis=-1)
     else:
         m = _dummy_mask()
+    has_sinks = sinks is not None
+    if has_sinks:
+        if sinks.ndim != 1 or sinks.shape[0] != Hq:
+            raise ValueError(f"attention_offsets: sinks {tuple(sinks.shape)} must be [{Hq}]")
+        sk = sinks.astype(queries.dtype)
+    else:
+        sk = mx.zeros((8,), queries.dtype)
+    if sk.shape[0] < 8:          # tiny inputs are passed in the constant address space; MLX's kernel reads a device pointer
+        sk = mx.concatenate([sk, mx.zeros((8 - sk.shape[0],), sk.dtype)])
     q = mx.contiguous(queries)
     if not kv_inplace:
         keys, values = mx.contiguous(keys), mx.contiguous(values)
     if pack is None:
-        pack = L == 1 and Hq > Hkv and not causal and m.shape[1] == 1
+        pack = L == 1 and Hq > Hkv and not causal and m.shape[1] == 1 and not has_sinks   # sinks are per head
     if pack:
         q = q.reshape(B, Hkv, Hq // Hkv, D)
     heads, rows = q.shape[1], q.shape[2]
     if wm is None:
         wm = 1 if rows <= 16 else 4
     bq = 16 * wm
-    out = _kernel()(inputs=[q, keys, values, m, pads, mx.array([scale], mx.float32)],
+    out = _kernel()(inputs=[q, keys, values, m, pads, mx.array([scale], mx.float32), sk],
                     template=[("T", queries.dtype), ("BD", D), ("WM", wm), ("HAS_MASK", has_mask),
-                              ("DO_CAUSAL", bool(causal))],
+                              ("DO_CAUSAL", bool(causal)), ("HAS_SINKS", has_sinks)],
                     grid=(((rows + bq - 1) // bq) * 32, heads * wm, B), threadgroup=(32, wm, 1),
                     output_shapes=[(B, heads, rows, D)], output_dtypes=[queries.dtype])[0]
     return out.reshape(B, Hq, L, D) if pack else out

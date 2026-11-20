@@ -22,7 +22,7 @@ def _warn_once_attn(key, msg):
         warnings.warn("mlx_exact: " + msg)
 
 
-def reference_attention(q, k, v, scale, mask):
+def reference_attention(q, k, v, scale, mask, sinks=None):
     """Differentiable attention from plain MLX ops (fp32 scores and softmax), any query count, grouped-query heads.
     mask: None, "causal" (bottom-right aligned), boolean or additive, broadcastable to [B, Hq, L, kL]. Rows without any
     valid key (boolean masks) give zeros, so they receive no gradient. Used only for backward passes: MLX's own
@@ -47,7 +47,13 @@ def reference_attention(q, k, v, scale, mask):
         valid = mx.any(mx.broadcast_to(m, s.shape), axis=-1, keepdims=True)
     elif m is not None:
         s = s + m.astype(mx.float32)
-    o = mx.softmax(s, axis=-1) @ v.astype(mx.float32)[:, :, None]
+    if sinks is not None:
+        # one sink logit per query head joins every row's softmax (MLX casts sinks to the query dtype first)
+        sk = sinks.astype(q.dtype).astype(mx.float32).reshape(1, Hkv, g, 1, 1)
+        p = mx.softmax(mx.concatenate([mx.broadcast_to(sk, s.shape[:-1] + (1,)), s], axis=-1), axis=-1)[..., 1:]
+    else:
+        p = mx.softmax(s, axis=-1)
+    o = p @ v.astype(mx.float32)[:, :, None]
     if valid is not None:
         o = mx.where(valid, o, 0.0)
     return o.reshape(B, Hq, L, v.shape[-1]).astype(q.dtype)
@@ -56,10 +62,11 @@ def reference_attention(q, k, v, scale, mask):
 _GRAD_FNS = {}
 
 
-def _differentiable(route, forward, scale, mask_kind, n_aux=0):
+def _differentiable(route, forward, scale, mask_kind, n_aux=0, sinks_aux=None):
     """mx.custom_function around an exact attention forward(q, k, v, m, *aux); backward = reference_attention's
-    gradient. mask_kind: "none", "causal" or "array" (m is then the mask; otherwise a placeholder)."""
-    key = (route, float(scale), mask_kind, n_aux)
+    gradient. mask_kind: "none", "causal" or "array" (m is then the mask; otherwise a placeholder). sinks_aux: index in
+    aux of the attention sinks (they get a gradient too), or None."""
+    key = (route, float(scale), mask_kind, n_aux, sinks_aux)
     if key not in _GRAD_FNS:
         @mx.custom_function
         def f(q, k, v, m, *aux):
@@ -69,8 +76,14 @@ def _differentiable(route, forward, scale, mask_kind, n_aux=0):
         def f_vjp(primals, cot, out):
             q, k, v, m = primals[:4]
             mm = m if mask_kind == "array" else ("causal" if mask_kind == "causal" else None)
-            _, g = mx.vjp(lambda a, b, c: reference_attention(a, b, c, scale, mm), [q, k, v], [cot])
-            return (g[0], g[1], g[2]) + tuple(mx.zeros_like(x) for x in primals[3:])
+            grads = [mx.zeros_like(x) for x in primals[3:]]
+            if sinks_aux is None:
+                _, g = mx.vjp(lambda a, b, c: reference_attention(a, b, c, scale, mm), [q, k, v], [cot])
+            else:
+                sk = primals[4 + sinks_aux]
+                _, g = mx.vjp(lambda a, b, c, d: reference_attention(a, b, c, scale, mm, d), [q, k, v, sk], [cot])
+                grads[1 + sinks_aux] = g[3].astype(sk.dtype)
+            return (g[0], g[1], g[2]) + tuple(grads)
         _GRAD_FNS[key] = f
     return _GRAD_FNS[key]
 
@@ -317,13 +330,14 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         keys, values, mask = _rotating_to_absolute(keys, values, mask, cache, L)
         STATS["sdpa_rotating_aligned"] = STATS.get("sdpa_rotating_aligned", 0) + 1
     arr = mask is not None and not isinstance(mask, str)
-    if (D in OFFSETS_HEAD_DIMS and sinks is None and values.shape[-1] == D and queries.dtype in OFFSETS_DTYPES
+    if (D in OFFSETS_HEAD_DIMS and (sinks is None or (sinks.ndim == 1 and sinks.shape[0] == queries.shape[1]))
+            and values.shape[-1] == D and queries.dtype in OFFSETS_DTYPES
             and keys.dtype == queries.dtype and values.dtype == queries.dtype and (not arr or mask.dtype == mx.bool_)
             and (not isinstance(mask, str) or (mask == "causal" and L <= keys.shape[2]))):
         if not arr and L >= 9:
             # stock attention already runs the canonical kernel for these
             STATS["sdpa_full"] = STATS.get("sdpa_full", 0) + 1
-            return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask)
+            return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask, sinks=sinks)
         B = queries.shape[0]
         brot = arr and not rotating and _is_batch_rotating(cache, keys)
         if brot:
@@ -339,10 +353,14 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         inplace = isinstance(cache, CONTIGUOUS_CACHES) and not brot
         STATS["sdpa_offsets"] = STATS.get("sdpa_offsets", 0) + 1
         kind = _mask_kind(mask)
-        fwd = lambda q, k, v, mm, pp: attention_offsets(q, k, v, scale, mm if kind == "array" else None, pp,
-                                                         kind == "causal", kv_inplace=inplace)
-        return _differentiable("offsets_inplace" if inplace else "offsets", fwd, scale, kind, 1)(
-            queries, keys, values, m, pads)
+        route = ("offsets_inplace" if inplace else "offsets") + ("_sinks" if sinks is not None else "")
+        if sinks is None:
+            fwd = lambda q, k, v, mm, pp: attention_offsets(q, k, v, scale, mm if kind == "array" else None, pp,
+                                                             kind == "causal", kv_inplace=inplace)
+            return _differentiable(route, fwd, scale, kind, 1)(queries, keys, values, m, pads)
+        fwd = lambda q, k, v, mm, pp, sk: attention_offsets(q, k, v, scale, mm if kind == "array" else None, pp,
+                                                             kind == "causal", kv_inplace=inplace, sinks=sk)
+        return _differentiable(route, fwd, scale, kind, 2, sinks_aux=1)(queries, keys, values, m, pads, sinks)
     if mask is not None and not isinstance(mask, str) and not rotating:
         if mask.dtype != mx.bool_:
             # additive (float) masks, e.g. DeepSeek-V3's MLA passes rotary score terms as the mask: no re-alignment or

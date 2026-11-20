@@ -74,6 +74,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
   - The kernel's six function constants become template parameters, and its entry point an inline function. The arithmetic is MLX's own.
   - For sequence b, the key, value and mask pointers start at its first valid key pads_b, and its key count is kL − pads_b. A row of a left-padded batch therefore sees exactly the keys, 32-key blocks and boundary handling of the same sequence alone.
   - KV-cache slices are read in place (strides passed through), so there is no copy of K or V.
+  - Attention sinks (gpt-oss) use the kernel's own sink path, one logit per query head, cast to the query dtype as MLX does. Query heads are then not packed into one tile.
   - Rows of a query tile are independent: each SIMD group owns 16 rows, and maxima and sums are reduced within a row. Decode therefore runs 16-row tiles and packs the query heads that share a KV head into the rows of one tile, reading each KV head once.
   - Bit-identical to the padded / re-aligned path below in 828 checks: head dims 64/96/128 × bf16/fp16/fp32; decode with 1–257 keys; chunks of 2–100 queries; left-padded batches vs each sequence alone; strided cache slices. fp32 keeps the old path, since fp32 models are outside the exact matmul routes.
 - **Attention, other head dims** (192/256 with two or more KV heads; fp32; attention sinks):
