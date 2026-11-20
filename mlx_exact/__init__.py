@@ -24,8 +24,9 @@ from .dispatch import CANONICAL, dense_stock_path, stock_qmm_path
 from .kernels import (dense_exact, dense_exact_v7, fp32_seq_matmul, gather_qmv_exact_v7, gather_qmv_nax_exact,
                       qmv_exact_bits, qmv_exact_v7, qmv_exact_v7_rows, qmv_nax_exact)
 from .nax_kernel import dense_nax_exact_v4, qmm_nax_exact_v4
+from .fp_kernel import fp_gather_exact_v4, fp_qmm_exact_v4
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}
@@ -59,6 +60,15 @@ def quantized_matmul(x, w, scales, biases, group_size=64, bits=4, mode="affine")
     """Drop-in for mx.quantized_matmul(..., transpose=True) with the canonical (long-prefill) arithmetic."""
     K, N = x.shape[-1], w.shape[0]
     M = x.size // K
+    if (mode == "mxfp4" and bits == 4 and group_size == 32 and biases is None and K % 64 == 0 and w.ndim == 2
+            and x.dtype in (mx.bfloat16, mx.float16)):
+        # MX format (gpt-oss experts and others): MLX's own fp_qmm_t_nax arithmetic with a 16-row tile (fp_kernel.py);
+        # stock's own 64-row kernel is kept where MLX runs it (same dispatch rules as affine, group size 32)
+        path = stock_qmm_path(M, N, K, group_size)
+        _STATS["mxfp4_" + path] = _STATS.get("mxfp4_" + path, 0) + 1
+        if path == CANONICAL:
+            return mx.quantized_matmul(x, w, scales, None, transpose=True, group_size=32, bits=4, mode="mxfp4")
+        return fp_qmm_exact_v4(x.reshape(M, K), w, scales).reshape(*x.shape[:-1], N)
     if (bits not in (4, 8) or group_size != 64 or mode != "affine" or K % 64 != 0 or biases is None
             or x.dtype not in (mx.bfloat16, mx.float16)):
         # fp32 activations: MLX's canonical kernel then runs at reduced (TF32-like) precision by default
@@ -118,6 +128,16 @@ def gather_quantized_matmul(x, w, scales, biases, indices, sorted_indices=False,
     B = 1
     for d in batch:
         B *= d
+    if (mode == "mxfp4" and bits == 4 and group_size == 32 and biases is None and K % 64 == 0
+            and x.dtype in (mx.bfloat16, mx.float16)):
+        if M == 1 and sorted_indices and B >= 16 and B // E >= 4:
+            _STATS["gather_mxfp4_canonical"] = _STATS.get("gather_mxfp4_canonical", 0) + 1
+            return mx.gather_qmm(x, w, scales, None, rhs_indices=indices, transpose=True, group_size=32, bits=4,
+                                 mode="mxfp4", sorted_indices=sorted_indices)
+        _STATS["gather_mxfp4_rerouted"] = _STATS.get("gather_mxfp4_rerouted", 0) + 1
+        xr = mx.broadcast_to(x, (*batch, M, K)).reshape(-1, K)
+        ir = mx.broadcast_to(mx.expand_dims(indices, -1), (*batch, M)).reshape(-1)
+        return fp_gather_exact_v4(xr, w, scales, ir).reshape(*batch, M, N)
     if (bits not in (4, 8) or group_size != 64 or mode != "affine" or K % 64 != 0 or biases is None
             or x.dtype not in (mx.bfloat16, mx.float16) or (bits == 8 and K % 256 != 0)):
         _warn_once(("g", bits, group_size, mode, str(x.dtype)), f"unsupported expert quantization (bits={bits}, "
@@ -257,6 +277,10 @@ def enable(force=False):
             return _orig["qsl"](self, x, indices, sorted_indices)
         b = self.get("biases")
         if b is None:
+            if getattr(self, "mode", "affine") == "mxfp4":
+                y = gather_quantized_matmul(x, self["weight"], self["scales"], None, indices, bool(sorted_indices),
+                                            self.group_size, self.bits, "mxfp4")
+                return y + mx.expand_dims(self["bias"][indices], -2) if "bias" in self else y
             return _orig["qsl"](self, x, indices, sorted_indices)
         y = _gather_fn(self.group_size, self.bits, getattr(self, "mode", "affine"), bool(sorted_indices))(
             x, self["weight"], self["scales"], b, indices)

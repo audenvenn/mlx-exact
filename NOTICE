@@ -1,12 +1,14 @@
 mlx_exact/_vendor/mlx_v0_32_4/ contains the following files from ml-explore/mlx v0.32.4, unmodified:
 mlx/backend/metal/kernels/steel/defines.h, steel/utils/type_traits.h, steel/utils/integral_constant.h,
-steel/gemm/nax.h, steel/gemm/gemm_nax.h, quantized_nax.h, steel/attn/params.h (as attn_params.h) and
-steel/attn/kernels/steel_attention_nax.h. Copyright © 2023-2026 Apple Inc., MIT License (see the LICENSE file in that
-directory). steel/attn/nax.h is identical to steel/gemm/nax.h in v0.32.4, so one copy serves both.
+steel/gemm/nax.h, steel/gemm/gemm_nax.h, quantized_nax.h, steel/attn/params.h (as attn_params.h),
+steel/attn/kernels/steel_attention_nax.h, fp4.h, fp8.h and fp_quantized_nax.h. Copyright © 2023-2026 Apple Inc.,
+MIT License (see the LICENSE file in that directory). steel/attn/nax.h is identical to steel/gemm/nax.h in v0.32.4, so one copy serves both.
 
 The files are modified only when mlx-exact assembles them into kernel headers at run time:
 - mlx_exact/nax_kernel.py drops three unused function-constant declarations and two batching helpers, and passes
   K, N, M by value;
 - mlx_exact/attn_nax.py takes the helper ops and the attention_nax kernel, turns its six function constants into
   template parameters and its [[kernel]] entry point into an inline function whose parameter structs live in thread
-  memory, and calls it from its own kernel with per-sequence key offsets.
+  memory, and calls it from its own kernel with per-sequence key offsets;
+- mlx_exact/fp_kernel.py takes the fp_quantized_nax.h helpers and fp_qmm_t_impl, drops three unused
+  function-constant declarations, and passes K, N, M by value.

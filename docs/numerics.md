@@ -67,6 +67,9 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
   - **v4** (4 or more rows): MLX's own accelerator implementation (vendored) run with a 16-row tile, exact by construction;
   - **dense v4** (unquantized, 5 or more rows): MLX's own dense accelerator GEMM loop (`gemm_loop`, vendored) with a 16-row tile, or with stock's own 128-row tile above 64 rows. The K order of an output element does not depend on the tile height, so this is the canonical arithmetic for every row count;
   - expert-indexed variants for MoE (v0 and v7 designs; each row reads its own expert's weights), and dense variants without dequantization.
+  - **mxfp4** (MX format, group size 32; since 0.9.0): MLX's own `fp_qmm_t_nax` implementation (vendored) with a 16-row tile, and an expert-indexed variant that runs it on one (row, expert) pair per threadgroup.
+    - Dequantization is the e8m0 scale times the e2m1 value in fp32, rounded to bf16, which is exact for mxfp4. The K loop and the 16×32×16 instruction are stock's.
+    - Both kernels are bit-identical to stock's long-prefill and sorted expert kernels.
 - **Attention, head dims 64/96/128 (bf16/fp16), since 0.8.0.** mlx-exact calls MLX's own accelerator attention kernel (`attention_nax`, vendored verbatim from v0.32.4) directly, for any query count.
   - The kernel's six function constants become template parameters, and its entry point an inline function. The arithmetic is MLX's own.
   - For sequence b, the key, value and mask pointers start at its first valid key pads_b, and its key count is kL − pads_b. A row of a left-padded batch therefore sees exactly the keys, 32-key blocks and boundary handling of the same sequence alone.
@@ -99,6 +102,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
 | decode / chunked prefill (4–512) vs full prefill: Qwen3-0.6B 4-bit and 8-bit; Qwen3.5-0.8B hybrid 4-bit and unquantized bf16; random MoE (4-bit); up to 2048 tokens | every position bit-identical |
 | greedy with cache vs recompute; greedy speculative vs plain (5 / 5); batched vs alone (4 / 4) | identical |
 | quantized KV cache (8-bit) | 300 / 300 positions identical |
+| gpt-oss-20b (MXFP4-Q8; mxfp4 experts, sinks, 128-token sliding windows): decode / chunks of 7 vs full prefill, 200-token prompt | 200 / 200 positions identical (stock 0 / 200); decode 0.77× of stock |
 | RL with LoRA: sampler vs trainer log-probs, before and after an optimizer step | 64 / 64 identical |
 | decode throughput (mlx-lm `generate_step`) | 0.93× of stock (Qwen3-0.6B-4bit: 306 vs 330 tok/s; Qwen3-1.7B-4bit: 126 vs 136), 0.97× (Qwen3-0.6B-8bit), 0.94× (Qwen3.5-0.8B-4bit), 0.98× (Qwen3.5-0.8B bf16). Before v7: 0.68–0.79× |
 | batched decode (BatchGenerator, Qwen3-0.6B-4bit, 8 sequences; 0.8.0) | 0.89× of stock (1,125 vs 1,260 generated tok/s); 0.7.x 0.35–0.45× |

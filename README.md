@@ -62,6 +62,7 @@ With mlx-exact the answers are identical under every schedule. Measured with 0.7
 | MoE greedy with KV cache vs recompute | diverges at token 4 | identical |
 | Qwen3-0.6B-8bit: decode / chunks vs full prefill | 0 / 360 positions | 360 / 360 |
 | Qwen3.5-0.8B unquantized (bf16): decode / chunks of 4, 9, 64 vs full prefill | 0 / 360 positions | 360 / 360 |
+| gpt-oss-20b (MXFP4-Q8: mxfp4 experts, sinks, sliding windows): decode / chunks of 7 vs full prefill, 200 tokens | 0 / 200 positions | 200 / 200 (decode 0.77× of stock) |
 | Quantized KV cache (8-bit, Qwen3-0.6B-4bit): decode / chunks of 4, 9, 64 vs full prefill | 0 / 300 positions | 300 / 300 |
 | RL with LoRA (Qwen3-0.6B-4bit): sampler vs trainer log-probs of 64 sampled tokens, before and after an optimizer step | 0 / 64 identical (mean \|Δ\| ≈ 0.05 nats/token) | 64 / 64 |
 | Decode throughput (end to end, mlx-lm `generate_step`) | 1× | 0.93× (Qwen3-0.6B-4bit, Qwen3-1.7B-4bit); 0.97× (Qwen3-0.6B-8bit); 0.94× (Qwen3.5-0.8B-4bit); 0.98× (Qwen3.5-0.8B bf16) |
@@ -91,15 +92,15 @@ mlx-exact takes the arithmetic MLX already uses for long prefills as **canonical
     - The KV cache is read in place: no query padding, no key copies.
   - For other head dims, query blocks are padded or split so that the same attention kernel always runs, and batched sequences are re-aligned so that their keys start at index 0.
 
-For calls with 4 or more rows, mlx-exact runs MLX's own accelerator implementation (vendored, MIT; `mlx_exact.nax_kernel`) with a 16-row tile, which is exact by construction and agrees bit for bit with the emulation kernels.
+For calls with 4 or more rows, mlx-exact runs MLX's own accelerator implementation (vendored, MIT; `mlx_exact.nax_kernel`) with a 16-row tile, which is exact by construction and agrees bit for bit with the emulation kernels. mxfp4 layers use MLX's own mxfp4 accelerator implementation the same way, for every row count (`mlx_exact.fp_kernel`).
 
 The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatch, the accelerator's measured accumulation order, the consequences in stock MLX, the method, and the results. The scripts in [`experiments/`](experiments) reproduce the main measurements (stock MLX vs mlx-exact, same run).
 
 ## Limitations
 - **Validated environment:** MLX 0.32.4 on Apple M6 (GPU architecture generation 18). `enable()` refuses other environments unless `force=True`, because the kernel-dispatch replica is version- and chip-specific.
-- **Weights and activations:** unquantized bf16/fp16, or 4- and 8-bit affine quantization with group size 64; bf16 or fp16 activations. Other formats, and fp32 activations, fall back to stock MLX with a warning, and exactness is then not guaranteed.
+- **Weights and activations:** unquantized bf16/fp16; 4- and 8-bit affine quantization with group size 64; and since 0.9.0 mxfp4 (MX format, group size 32, e.g. gpt-oss's experts). Activations bf16 or fp16. Other formats (nvfp4, mxfp8) and fp32 activations fall back to stock MLX with a warning, and exactness is then not guaranteed.
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), attention sinks combined with a quantized KV cache, and models that call `mx.fast.scaled_dot_product_attention` directly instead of mlx-lm's `scaled_dot_product_attention`.
-- **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2, granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above. gpt_oss was tested with affine-quantized experts; released gpt-oss checkpoints use mxfp4 experts, which mlx-exact does not support (they fall back to stock with a warning).
+- **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2, granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above. Real gpt-oss: with `mlx-community/gpt-oss-20b-MXFP4-Q8` (mxfp4 experts; attention sinks; 128-token sliding windows), decode and prefill chunks are bit-identical to one full prefill at all 200 positions of a 200-token prompt (stock: 0 / 200), for a single sequence.
 - **Sliding-window attention** (rotating KV cache: Gemma 3, Cohere 2, EXAONE 4, gpt-oss, …): bit-exact for a single sequence since 0.6.0. The window is put back in temporal order and aligned to the attention kernel's 32-key blocks, with at most 31 extra masked keys per step. Not covered:
   - batched generation with sliding windows;
   - caches with a kept prefix (`keep > 0`, e.g. mlx-lm's `--max-kv-size`);
@@ -124,6 +125,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - attention against prefill rows, and left-padding re-alignment;
 - MLX's attention kernel with per-sequence key offsets against the padded / re-aligned path; a left-padded batch through `Qwen3-0.6B-4bit` (if cached) against each sequence alone;
 - the fixed-order attention kernels against the previous (one thread per output) kernels, bit for bit (`tests/test_fixed_order.py`);
+- mxfp4: the dense and expert kernels against stock's long-prefill and sorted expert kernels, and a tiny random gpt-oss with mxfp4 experts end to end (`tests/test_mxfp4.py`);
 - regression tests from an independent pre-release review (`tests/test_attention_review.py`):
   - unusual masks, layouts and shapes;
   - rows without a valid key, and a left-padded batch through a head-dim-256, single-KV-head model;
@@ -140,6 +142,11 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above. 0.8.0 also had an independent pre-release code review by another AI model (OpenAI's Codex); each reported bug was confirmed with a regression test and fixed, and the remaining points (limits of scope) are documented above.
 
 ## Changes
+- **0.9.0:** mxfp4 (MX-format) layers are exact, e.g. the experts of gpt-oss.
+  - mlx-exact runs MLX's own mxfp4 accelerator implementation (vendored) with a 16-row tile for any row count, plus an expert-indexed variant for MoE layers.
+  - Both are bit-identical to stock's long-prefill and sorted expert kernels.
+  - With `mlx-community/gpt-oss-20b-MXFP4-Q8`, decode and chunked prefill match one full prefill at every position of a 200-token prompt (stock: none), at 0.77× of stock decode speed.
+  - New tests: `tests/test_mxfp4.py`, including a tiny random gpt-oss with mxfp4 experts.
 - **0.8.1:** faster fixed-order attention for head dims 192/256 with one KV head (e.g. Gemma 3 1B / 270M). Prefill attention is 2.4–3× faster: 0.95 vs 2.32 ms at 512 tokens and 11.8 vs 35.4 ms at 2,048 tokens, against stock MLX's 0.32 / 0.97 ms.
   - Every output is still the same sequential fp32 chain. Each thread now computes a 4 × 4 block of outputs from tiles staged in threadgroup memory, and one SIMD group handles each softmax row; its sum stays sequential.
   - Results are bit-identical to 0.8.0, checked against the previous kernels in `tests/test_fixed_order.py`.
