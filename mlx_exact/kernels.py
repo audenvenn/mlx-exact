@@ -1021,3 +1021,31 @@ def shift_rows_left(x, pad):
     return _kernels["shift_rows"](inputs=[x, pad.astype(mx.int32), mx.array([KL, H, D], dtype=mx.int32)],
                                   template=[("T", x.dtype)], grid=(D, KL, B * H), threadgroup=(min(D, 128), 1, 1),
                                   output_shapes=[x.shape], output_dtypes=[x.dtype])[0]
+
+
+# Per-sequence RIGHT shift of K / V rows into a longer buffer (absolute-position alignment for batched sliding-window
+# caches): out[b, h, j] = x[b, h, j - r[b]] for 0 <= j - r[b] < kL, zeros elsewhere; out has KO >= kL rows.
+_SRC_SHIFT_RIGHT = r"""
+    const uint d = thread_position_in_grid.x;
+    const uint j = thread_position_in_grid.y;
+    const uint bh = thread_position_in_grid.z;
+    const int KL = int(dims[0]);
+    const int KO = int(dims[1]);
+    const int H = int(dims[2]);
+    const int D = int(dims[3]);
+    if (int(d) >= D || int(j) >= KO) { return; }
+    const int b = int(bh) / H;
+    const int src = int(j) - int(r[b]);
+    out[(size_t(bh) * KO + j) * D + d] = (src >= 0 && src < KL) ? x[(size_t(bh) * KL + src) * D + d] : T(0);
+"""
+
+
+def shift_rows_right(x, r, out_len):
+    """x [B, H, kL, D]; r [B] int in [0, out_len - kL]: out[b, :, j] = x[b, :, j - r[b]] (zeros elsewhere)."""
+    B, H, KL, D = x.shape
+    if "shift_right" not in _kernels:
+        _kernels["shift_right"] = mx.fast.metal_kernel(name="mlx_exact_shift_rows_right", input_names=["x", "r", "dims"],
+                                                       output_names=["out"], source=_SRC_SHIFT_RIGHT)
+    return _kernels["shift_right"](inputs=[x, r.astype(mx.int32), mx.array([KL, out_len, H, D], dtype=mx.int32)],
+                                   template=[("T", x.dtype)], grid=(D, out_len, B * H), threadgroup=(min(D, 128), 1, 1),
+                                   output_shapes=[(B, H, out_len, D)], output_dtypes=[x.dtype])[0]

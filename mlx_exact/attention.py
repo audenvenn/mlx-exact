@@ -8,7 +8,7 @@ long prefills, whatever the number of queries in the call, the context length or
 """
 import mlx.core as mx
 
-from .kernels import dense_attention_exact, qkv_attention_exact, shift_rows_left
+from .kernels import dense_attention_exact, qkv_attention_exact, shift_rows_left, shift_rows_right
 from .attn_nax import _dummy_mask, attention_offsets, first_valid_key
 
 STATS = {}
@@ -115,6 +115,62 @@ def _shift_left_vjp(primals, cot, out):
     src = mx.arange(kL).reshape(1, 1, kL, 1) - pad.reshape(B, 1, 1, 1)
     g = mx.take_along_axis(cot, mx.broadcast_to(mx.maximum(src, 0), cot.shape), axis=2)
     return mx.where(src >= 0, g, 0).astype(x.dtype), mx.zeros_like(pad)
+
+
+@mx.custom_function
+def _shift_right(x, r, pad_to):
+    return shift_rows_right(x, r, pad_to.shape[0])
+
+
+@_shift_right.vjp
+def _shift_right_vjp(primals, cot, out):
+    """out[b, :, j] = x[b, :, j - r_b]  =>  dx[b, :, i] = cot[b, :, i + r_b]."""
+    x, r, pad_to = primals
+    B, kL = x.shape[0], x.shape[2]
+    src = mx.arange(kL).reshape(1, 1, kL, 1) + r.reshape(B, 1, 1, 1)
+    g = mx.take_along_axis(cot, mx.broadcast_to(src, (B, cot.shape[1], kL, cot.shape[3])), axis=2)
+    return g.astype(x.dtype), mx.zeros_like(r), mx.zeros_like(pad_to)
+
+
+def _is_batch_rotating(cache, keys):
+    """mlx-lm BatchRotatingKVCache (batched sliding-window layers): one ring buffer shared by the batch, per-sequence
+    offsets (absolute positions) and left padding."""
+    return (cache is not None and hasattr(cache, "max_size") and hasattr(cache, "left_padding")
+            and hasattr(cache, "_idx") and not hasattr(cache, "bits") and isinstance(getattr(cache, "offset", None), mx.array)
+            and cache.offset.ndim == 1 and cache.offset.shape[0] == keys.shape[0])
+
+
+def _batch_rotating_temporal(keys, values, mask, cache, L):
+    """Temporal order: at decode the cache returns its ring in buffer order, oldest entry at the next write slot."""
+    kL = keys.shape[2]
+    if L == 1:
+        i = int(cache._idx) % kL
+        if i:
+            keys = mx.concatenate([keys[:, :, i:], keys[:, :, :i]], axis=2)
+            values = mx.concatenate([values[:, :, i:], values[:, :, :i]], axis=2)
+            if mask is not None and not isinstance(mask, str):
+                mask = mx.concatenate([mask[..., i:], mask[..., :i]], axis=-1)
+    return keys, values, mask
+
+
+def _batch_rotating_absolute(keys, values, mask, cache, L):
+    """Temporal order, then shift every sequence right by (absolute position of its first key) mod 32 so that each key
+    sits at an index congruent to its absolute position: the 32-key blocks of a full prefill, per sequence (the batched
+    form of _rotating_to_absolute). The added rows are zero keys, always masked."""
+    keys, values, mask = _batch_rotating_temporal(keys, values, mask, cache, L)
+    B, H, kL, D = keys.shape
+    r = mx.remainder(cache.offset.astype(mx.int32) - kL, KV_BLOCK)
+    KO = kL + KV_BLOCK - 1
+    pad_to = mx.zeros((KO,), mx.int32)
+    k2 = _shift_right(keys, r, pad_to)
+    v2 = _shift_right(values, r, pad_to)
+    m = mask if mask.ndim == 4 else mask.reshape((1,) * (4 - mask.ndim) + tuple(mask.shape))
+    m = mx.broadcast_to(m, (B,) + tuple(m.shape[1:3]) + (kL,))
+    src = mx.arange(KO).reshape(1, 1, 1, KO) - r.reshape(B, 1, 1, 1)
+    ok = (src >= 0) & (src < kL)
+    idx = mx.broadcast_to(mx.clip(src, 0, kL - 1), (B,) + tuple(m.shape[1:3]) + (KO,))
+    m2 = mx.take_along_axis(m, idx, axis=-1) & mx.broadcast_to(ok, idx.shape)
+    return k2, v2, m2
 
 
 def _align_left_padding(keys, values, mask):
@@ -242,6 +298,10 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         # needs no padding or re-alignment, only temporal order for a rotating cache. Slower prefill than MLX's.
         if _is_rotating(cache, keys):
             keys, values, mask = _rotating_to_absolute(keys, values, mask, cache, L)
+        elif _is_batch_rotating(cache, keys):
+            # fixed-order arithmetic depends only on the order of the valid keys: temporal order is enough
+            keys, values, mask = _batch_rotating_temporal(keys, values, mask, cache, L)
+            STATS["sdpa_batch_rotating_temporal"] = STATS.get("sdpa_batch_rotating_temporal", 0) + 1
         STATS["sdpa_fixed_order"] = STATS.get("sdpa_fixed_order", 0) + 1
         kind = _mask_kind(mask)
         fwd = lambda q, k, v, mm: dense_attention_exact(q, k, v, scale, mm if kind == "array" else
@@ -264,13 +324,19 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
             # stock attention already runs the canonical kernel for these
             STATS["sdpa_full"] = STATS.get("sdpa_full", 0) + 1
             return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask)
-        B, kL = queries.shape[0], keys.shape[2]
+        B = queries.shape[0]
+        brot = arr and not rotating and _is_batch_rotating(cache, keys)
+        if brot:
+            # batched sliding window: per-sequence absolute-position alignment (copies; sliding layers only)
+            keys, values, mask = _batch_rotating_absolute(keys, values, mask, cache, L)
+            STATS["sdpa_batch_rotating_aligned"] = STATS.get("sdpa_batch_rotating_aligned", 0) + 1
+        kL = keys.shape[2]
         # a rotating cache's keys were placed at their absolute positions mod 32 above: no further offset
-        pads = _sequence_origins(cache, mask, B, kL) if arr and not rotating else _zeros(B)
+        pads = _sequence_origins(cache, mask, B, kL) if arr and not rotating and not brot else _zeros(B)
         m = mask if arr else _dummy_mask()
         # while exact mode is on, mlx-lm's attention caches store contiguous K/V (see enable()), so the slices they
         # return have a contiguous last dimension: read them in place. Anything else is made contiguous first.
-        inplace = isinstance(cache, CONTIGUOUS_CACHES)
+        inplace = isinstance(cache, CONTIGUOUS_CACHES) and not brot
         STATS["sdpa_offsets"] = STATS.get("sdpa_offsets", 0) + 1
         kind = _mask_kind(mask)
         fwd = lambda q, k, v, mm, pp: attention_offsets(q, k, v, scale, mm if kind == "array" else None, pp,

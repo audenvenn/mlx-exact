@@ -103,7 +103,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), attention sinks combined with a quantized KV cache, and models that call `mx.fast.scaled_dot_product_attention` directly instead of mlx-lm's `scaled_dot_product_attention`.
 - **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2, granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above. Real gpt-oss: with `mlx-community/gpt-oss-20b-MXFP4-Q8` (mxfp4 experts; attention sinks; 128-token sliding windows), decode and prefill chunks are bit-identical to one full prefill at all 200 positions of a 200-token prompt (stock: 0 / 200), for a single sequence.
 - **Sliding-window attention** (rotating KV cache: Gemma 3, Cohere 2, EXAONE 4, gpt-oss, …): bit-exact for a single sequence since 0.6.0. The window is put back in temporal order and aligned to the attention kernel's 32-key blocks, with at most 31 extra masked keys per step. Not covered:
-  - batched generation with sliding windows;
+  - batched generation with sliding windows when the layer has attention sinks (gpt-oss), or head dims 192/256 with two or more KV heads (Gemma 3 4B and larger). Batched sliding windows are bit-exact since 0.10.0 for head dims 64/96/128 (bf16/fp16) and for head dims 192/256 with one KV head: the shared ring buffer is put back in temporal order, and each sequence is shifted to its absolute positions modulo 32;
   - caches with a kept prefix (`keep > 0`, e.g. mlx-lm's `--max-kv-size`);
   - the head-dim case below.
 - **Head dims 192/256 with a single KV head** (e.g. Gemma 3 1B): MLX computes attention for these head dims with an unfused path whose internal kernels depend on the query and key counts, and with one KV head the results differ between schedules. Since 0.7.0 mlx-exact uses its own fixed-order attention there (fp32 scores and softmax; accuracy at least stock's). It is bit-exact, but slower: prefill attention for those layers takes about 3× (512 tokens) to 12× (2,048 tokens) as long as MLX's, and decode attention about 2–2.5× (since 0.8.1; 0.7.0–0.8.0: 7× to 36× on the same measurement). Models with two or more KV heads keep MLX's attention.
@@ -127,6 +127,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - MLX's attention kernel with per-sequence key offsets against the padded / re-aligned path; a left-padded batch through `Qwen3-0.6B-4bit` (if cached) against each sequence alone;
 - the fixed-order attention kernels against the previous (one thread per output) kernels, bit for bit (`tests/test_fixed_order.py`);
 - mxfp4: the dense and expert kernels against stock's long-prefill and sorted expert kernels, and a tiny random gpt-oss with mxfp4 experts end to end (`tests/test_mxfp4.py`);
+- batched sliding windows: a left-padded batch through sliding-window models, every step's logits against each sequence alone (`tests/test_batch_sliding.py`);
 - regression tests from an independent pre-release review (`tests/test_attention_review.py`):
   - unusual masks, layouts and shapes;
   - rows without a valid key, and a left-padded batch through a head-dim-256, single-KV-head model;
@@ -143,6 +144,9 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above. 0.8.0 also had an independent pre-release code review by another AI model (OpenAI's Codex); each reported bug was confirmed with a regression test and fixed, and the remaining points (limits of scope) are documented above.
 
 ## Changes
+- **0.10.0:** batched generation with sliding windows (mlx-lm `BatchRotatingKVCache`, used by `BatchGenerator` and `mlx_lm.server` for Gemma 3, Cohere 2, EXAONE 4 and similar) is bit-exact for head dims 64/96/128 and for head dims 192/256 with one KV head.
+  - Every sequence's window is put back in temporal order and shifted to its absolute positions modulo 32. The shift comes from the per-sequence offsets that RoPE also uses, so each sequence sees the 32-key blocks of its own full prefill.
+  - New tests (`tests/test_batch_sliding.py`): a left-padded batch through tiny Gemma 3 / Cohere 2 / EXAONE 4 models and a head-dim-256, one-KV-head Gemma 3, prefilled whole or in chunks of 16, then 40 decode steps. Every step's logits are bit-identical to each sequence alone; with 0.9.0 they were not.
 - **0.9.0:** mxfp4 (MX-format) layers are exact, e.g. the experts of gpt-oss.
   - mlx-exact runs MLX's own mxfp4 accelerator implementation (vendored) with a 16-row tile for any row count, plus an expert-indexed variant for MoE layers.
   - Both are bit-identical to stock's long-prefill and sorted expert kernels.
