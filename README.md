@@ -44,7 +44,7 @@ print(mlx_exact.stats())               # which kernels stock MLX would have used
 | Qwen3-1.7B-4bit | 77.7–80.0% | 59 / 300 (20%) | same answers under every schedule |
 | Qwen3.5-0.8B-4bit | 41.0–43.7% | 179 / 300 (60%) | same answers under every schedule |
 
-Aggregate accuracy moves by up to 3 points (not significant: the flips go both ways), but per-problem answers depend heavily on the schedule. That noise affects any paired comparison on the same problems.
+Aggregate accuracy moves by up to 3 points (not significant: the flips go both ways), but per-problem answers depend heavily on the schedule. That noise affects any paired comparison on the same problems. A short write-up of this result: [Same prompt, different answer: MLX's output depends on how the work is scheduled](https://audenvenn.github.io/2026/11/20/mlx-output-depends-on-schedule.html).
 
 With mlx-exact the answers are identical under every schedule. Measured with 0.7.0, the cost was 0.86–0.93× of the stock wall time for single sequences, and 0.35–0.72× for batches of 8. 0.8.0 makes batched exact decode about 2× faster (0.89× of stock in the throughput test below).
 
