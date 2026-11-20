@@ -876,7 +876,8 @@ _SRC_DATT_SOFTMAX = r"""
         prow[j] = e;
         sum += e;
     }
-    const float inv = 1.0f / sum;
+    // a row without any valid key gives zeros (not 0/0 = NaN, which would reach real rows of later layers as 0 * NaN)
+    const float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
     for (int j = 0; j < KL; j++) { prow[j] = prow[j] * inv; }
 """
 _SRC_DATT_OUT = r"""

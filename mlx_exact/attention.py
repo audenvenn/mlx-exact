@@ -9,6 +9,7 @@ long prefills, whatever the number of queries in the call, the context length or
 import mlx.core as mx
 
 from .kernels import dense_attention_exact, qkv_attention_exact, shift_rows_left
+from .attn_nax import _dummy_mask, attention_offsets, first_valid_key
 
 STATS = {}
 _WARNED = set()
@@ -19,6 +20,101 @@ def _warn_once_attn(key, msg):
         _WARNED.add(key)
         import warnings
         warnings.warn("mlx_exact: " + msg)
+
+
+def reference_attention(q, k, v, scale, mask):
+    """Differentiable attention from plain MLX ops (fp32 scores and softmax), any query count, grouped-query heads.
+    mask: None, "causal" (bottom-right aligned), boolean or additive, broadcastable to [B, Hq, L, kL]. Rows without any
+    valid key (boolean masks) give zeros, so they receive no gradient. Used only for backward passes: MLX's own
+    attention gradient needs its full-attention kernel in the forward pass (more than 8 queries), and mlx-exact's
+    kernels have none."""
+    B, Hq, L, D = q.shape
+    Hkv, kL = k.shape[1], k.shape[2]
+    g = Hq // Hkv
+    qf = (q.astype(mx.float32) * scale).reshape(B, Hkv, g, L, D)
+    s = qf @ k.astype(mx.float32)[:, :, None].swapaxes(-1, -2)                  # [B, Hkv, g, L, kL]
+    if isinstance(mask, str):
+        m = mx.arange(kL)[None, :] <= (mx.arange(L)[:, None] + kL - L)            # [L, kL]
+    elif mask is not None:
+        m = mask if mask.ndim == 4 else mask.reshape((1,) * (4 - mask.ndim) + tuple(mask.shape))
+        # [Bm, Hm, Lm, Km] -> [Bm, Hkv | 1, g | 1, Lm, Km]; broadcasts against the scores
+        m = m.reshape(m.shape[0], Hkv, g, m.shape[2], m.shape[3]) if m.shape[1] == Hq and Hq > 1 else m[:, :, None]
+    else:
+        m = None
+    valid = None
+    if m is not None and m.dtype == mx.bool_:
+        s = mx.where(m, s, mx.finfo(mx.float32).min)
+        valid = mx.any(mx.broadcast_to(m, s.shape), axis=-1, keepdims=True)
+    elif m is not None:
+        s = s + m.astype(mx.float32)
+    o = mx.softmax(s, axis=-1) @ v.astype(mx.float32)[:, :, None]
+    if valid is not None:
+        o = mx.where(valid, o, 0.0)
+    return o.reshape(B, Hq, L, v.shape[-1]).astype(q.dtype)
+
+
+_GRAD_FNS = {}
+
+
+def _differentiable(route, forward, scale, mask_kind, n_aux=0):
+    """mx.custom_function around an exact attention forward(q, k, v, m, *aux); backward = reference_attention's
+    gradient. mask_kind: "none", "causal" or "array" (m is then the mask; otherwise a placeholder)."""
+    key = (route, float(scale), mask_kind, n_aux)
+    if key not in _GRAD_FNS:
+        @mx.custom_function
+        def f(q, k, v, m, *aux):
+            return forward(q, k, v, m, *aux)
+
+        @f.vjp
+        def f_vjp(primals, cot, out):
+            q, k, v, m = primals[:4]
+            mm = m if mask_kind == "array" else ("causal" if mask_kind == "causal" else None)
+            _, g = mx.vjp(lambda a, b, c: reference_attention(a, b, c, scale, mm), [q, k, v], [cot])
+            return (g[0], g[1], g[2]) + tuple(mx.zeros_like(x) for x in primals[3:])
+        _GRAD_FNS[key] = f
+    return _GRAD_FNS[key]
+
+
+def _mask_kind(mask):
+    return "none" if mask is None else ("causal" if isinstance(mask, str) else "array")
+
+
+def _qkv_differentiable(scale, kind, group_size, bits):
+    """Quantized-KV attention with a backward pass for the queries (reference attention on the dequantized cache);
+    the cache itself gets zero gradients."""
+    key = ("qkv", float(scale), kind, group_size, bits)
+    if key not in _GRAD_FNS:
+        def _m(m):
+            return m if kind == "array" else ("causal" if kind == "causal" else None)
+
+        @mx.custom_function
+        def f(q, kq, ks, kb, vq, vs, vb, m):
+            return qkv_attention_exact(q, (kq, ks, kb), (vq, vs, vb), scale, _m(m), group_size, bits)
+
+        @f.vjp
+        def f_vjp(primals, cot, out):
+            q, kq, ks, kb, vq, vs, vb, m = primals
+            k = mx.dequantize(kq, ks, kb, group_size=group_size, bits=bits)
+            v = mx.dequantize(vq, vs, vb, group_size=group_size, bits=bits)
+            _, g = mx.vjp(lambda a: reference_attention(a, k, v, scale, _m(m)), [q], [cot])
+            return (g[0],) + tuple(mx.zeros_like(x) for x in primals[1:])
+        _GRAD_FNS[key] = f
+    return _GRAD_FNS[key]
+
+
+@mx.custom_function
+def _shift_left(x, pad):
+    return shift_rows_left(x, pad)
+
+
+@_shift_left.vjp
+def _shift_left_vjp(primals, cot, out):
+    """out[b, :, j] = x[b, :, j + pad_b]  =>  dx[b, :, i] = cot[b, :, i - pad_b] for i >= pad_b, else 0."""
+    x, pad = primals
+    B, kL = x.shape[0], x.shape[2]
+    src = mx.arange(kL).reshape(1, 1, kL, 1) - pad.reshape(B, 1, 1, 1)
+    g = mx.take_along_axis(cot, mx.broadcast_to(mx.maximum(src, 0), cot.shape), axis=2)
+    return mx.where(src >= 0, g, 0).astype(x.dtype), mx.zeros_like(pad)
 
 
 def _align_left_padding(keys, values, mask):
@@ -42,8 +138,8 @@ def _align_left_padding(keys, values, mask):
     src = j + pad
     valid = src < kL
     # shifted copies of K and V (per-sequence offset, zeros past the end): a plain copy kernel, no index arrays
-    k2 = shift_rows_left(keys, pad.reshape(B))
-    v2 = shift_rows_left(values, pad.reshape(B))
+    k2 = _shift_left(keys, pad.reshape(B).astype(mx.int32))
+    v2 = _shift_left(values, pad.reshape(B).astype(mx.int32))
     mb = mx.broadcast_to(m, (B, m.shape[1], m.shape[2], kL))
     idx_m = mx.broadcast_to(mx.minimum(src, kL - 1), mb.shape)
     m2 = mx.logical_and(mx.take_along_axis(mb, idx_m, axis=-1), mx.broadcast_to(valid, mb.shape))
@@ -51,6 +147,37 @@ def _align_left_padding(keys, values, mask):
 
 
 KV_BLOCK = 32       # key block of MLX's fused accelerator attention kernel (sdpa_full_self_attention_nax: bk = 32)
+
+# MLX's own accelerator attention kernel with per-sequence key offsets (attn_nax.py): no query padding, no K/V copies.
+# Enabled for the head dims and dtypes verified bit-exact against the padded / re-aligned path (FINDINGS F34). fp32 is
+# bit-exact too while MLX_ENABLE_TF32 is on, but fp32 models are outside the exact matmul routes, so it keeps the old
+# path.
+OFFSETS_HEAD_DIMS = (64, 96, 128)
+OFFSETS_DTYPES = (mx.bfloat16, mx.float16)
+_ZEROS = {}
+CONTIGUOUS_CACHES = ()      # set by enable(): mlx-lm cache classes that store contiguous K/V
+
+
+def _sequence_origins(cache, mask, B, kL):
+    """Index of each sequence's first key, i.e. where its keys start when it runs alone. mlx-lm's BatchKVCache records
+    it (left_padding: sequence b's tokens are at [left_padding[b], kL)), which is exact for any mask that hides the
+    padding, as mlx-lm's own masks do; the earliest key the mask shows is used if it comes first. Without such a
+    cache it is derived from the mask: the earliest valid key over all rows, which equals the left padding for causal
+    masks with left padding (for other masks the values are right, but the block origin can vary between schedules)."""
+    fv = first_valid_key(mask, B, kL)
+    lp = getattr(cache, "left_padding", None)
+    if isinstance(lp, mx.array) and not hasattr(cache, "max_size") and lp.ndim == 1 and lp.shape[0] == B:
+        # a mask that shows keys before the recorded padding (not mlx-lm's own) moves the origin back to them
+        return mx.minimum(lp.astype(mx.int32), fv)
+    return fv
+
+
+def _zeros(B):
+    if B not in _ZEROS:
+        _ZEROS[B] = mx.zeros((B,), mx.int32)
+    return _ZEROS[B]
+
+
 
 
 def _is_rotating(cache, keys):
@@ -97,9 +224,16 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         if sinks is not None:
             raise NotImplementedError("exact mode: attention sinks with a quantized KV cache")
         STATS["quantized_kv"] = STATS.get("quantized_kv", 0) + 1
-        return qkv_attention_exact(queries, keys, values, scale, mask, cache.group_size, cache.bits)
+        kind = _mask_kind(mask)
+        return _qkv_differentiable(scale, kind, cache.group_size, cache.bits)(
+            queries, *keys, *values, mask if kind == "array" else _dummy_mask())
     L = queries.shape[2]
     D = queries.shape[3]
+    if (mask is not None and not isinstance(mask, str) and keys.shape[2] > 1
+            and (mask.ndim == 0 or mask.shape[-1] == 1)):
+        # a mask broadcast along the keys: give it its full key axis before rotating / re-aligning its columns
+        m4 = mask.reshape((1,) * (4 - mask.ndim) + tuple(mask.shape)) if mask.ndim < 4 else mask
+        mask = mx.broadcast_to(m4, tuple(m4.shape[:-1]) + (keys.shape[2],))
     if (D in (192, 256) and keys.shape[1] == 1 and sinks is None
             and (mask is None or isinstance(mask, str) or mask.dtype == mx.bool_)):
         # For these head dims MLX attends with an unfused path whose internal kernels depend on the query and key
@@ -109,11 +243,40 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         if _is_rotating(cache, keys):
             keys, values, mask = _rotating_to_absolute(keys, values, mask, cache, L)
         STATS["sdpa_fixed_order"] = STATS.get("sdpa_fixed_order", 0) + 1
-        return dense_attention_exact(queries, keys, values, scale, mask)
+        kind = _mask_kind(mask)
+        fwd = lambda q, k, v, mm: dense_attention_exact(q, k, v, scale, mm if kind == "array" else
+                                                        ("causal" if kind == "causal" else None))
+        return _differentiable("fixed_order", fwd, scale, kind)(queries, keys, values,
+                                                                mask if kind == "array" else _dummy_mask())
+    if L > keys.shape[2]:
+        # more queries than keys (not a decoder's self-attention): stock attention, whose arithmetic this shape defines
+        STATS["sdpa_more_queries_stock"] = STATS.get("sdpa_more_queries_stock", 0) + 1
+        return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask, sinks=sinks)
     rotating = _is_rotating(cache, keys) and (mask is None or isinstance(mask, str) or mask.dtype == mx.bool_)
     if rotating:
         keys, values, mask = _rotating_to_absolute(keys, values, mask, cache, L)
         STATS["sdpa_rotating_aligned"] = STATS.get("sdpa_rotating_aligned", 0) + 1
+    arr = mask is not None and not isinstance(mask, str)
+    if (D in OFFSETS_HEAD_DIMS and sinks is None and values.shape[-1] == D and queries.dtype in OFFSETS_DTYPES
+            and keys.dtype == queries.dtype and values.dtype == queries.dtype and (not arr or mask.dtype == mx.bool_)
+            and (not isinstance(mask, str) or (mask == "causal" and L <= keys.shape[2]))):
+        if not arr and L >= 9:
+            # stock attention already runs the canonical kernel for these
+            STATS["sdpa_full"] = STATS.get("sdpa_full", 0) + 1
+            return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask)
+        B, kL = queries.shape[0], keys.shape[2]
+        # a rotating cache's keys were placed at their absolute positions mod 32 above: no further offset
+        pads = _sequence_origins(cache, mask, B, kL) if arr and not rotating else _zeros(B)
+        m = mask if arr else _dummy_mask()
+        # while exact mode is on, mlx-lm's attention caches store contiguous K/V (see enable()), so the slices they
+        # return have a contiguous last dimension: read them in place. Anything else is made contiguous first.
+        inplace = isinstance(cache, CONTIGUOUS_CACHES)
+        STATS["sdpa_offsets"] = STATS.get("sdpa_offsets", 0) + 1
+        kind = _mask_kind(mask)
+        fwd = lambda q, k, v, mm, pp: attention_offsets(q, k, v, scale, mm if kind == "array" else None, pp,
+                                                         kind == "causal", kv_inplace=inplace)
+        return _differentiable("offsets_inplace" if inplace else "offsets", fwd, scale, kind, 1)(
+            queries, keys, values, m, pads)
     if mask is not None and not isinstance(mask, str) and not rotating:
         if mask.dtype != mx.bool_:
             # additive (float) masks, e.g. DeepSeek-V3's MLA passes rotary score terms as the mask: no re-alignment or
@@ -136,11 +299,12 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
             raise NotImplementedError("exact mode: array masks with >= 1024 queries for head dim 192/256")
         outs = []
         kL = keys.shape[2]
+        causal = mask is not None
         for s0 in range(0, L, 1008):
             e0 = min(L, s0 + 1008)
-            kv_end = kL - (L - e0)
+            kv_end = kL - (L - e0) if causal else kL          # unrestricted attention keeps every key
             outs.append(exact_sdpa(queries[:, :, s0:e0], keys[:, :, :kv_end], values[:, :, :kv_end], cache, scale,
-                                   "causal", sinks))
+                                   "causal" if causal else None, sinks))
         STATS["sdpa_split_1008"] = STATS.get("sdpa_split_1008", 0) + 1
         return mx.concatenate(outs, axis=2)
     if L >= P:
@@ -161,7 +325,9 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
             out = mx.fast.scaled_dot_product_attention(qp, keys, values, scale=scale, mask=mp, sinks=sinks)
             return out[:, :, pad:]
         STATS["sdpa_padded"] = STATS.get("sdpa_padded", 0) + 1
-        out = mx.fast.scaled_dot_product_attention(qp, keys, values, scale=scale, mask="causal", sinks=sinks)
+        # causal, or a single query (sees every key either way); unrestricted attention for several queries
+        pm = "causal" if (mask is not None or L == 1) else None
+        out = mx.fast.scaled_dot_product_attention(qp, keys, values, scale=scale, mask=pm, sinks=sinks)
         return out[:, :, pad:]
     # Short context (decode of the first P-1 positions): a query block longer than the key block would leave MLX's fused
     # kernel. Build a square P x P causal problem instead: keys/values padded with zero rows at the end (always masked,
@@ -191,5 +357,10 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         out = mx.fast.scaled_dot_product_attention(qp, kp, vp, scale=scale, mask=m, sinks=sinks)
         return out[:, :, before:before + L]
     STATS["sdpa_padded_square"] = STATS.get("sdpa_padded_square", 0) + 1
-    out = mx.fast.scaled_dot_product_attention(qp, kp, vp, scale=scale, mask="causal", sinks=sinks)
+    if mask is None and L > 1:
+        # unrestricted attention for several queries: every real key visible, the zero keys masked
+        sq = mx.concatenate([mx.ones((1, 1, P, kL), mx.bool_), mx.zeros((1, 1, P, P - kL), mx.bool_)], axis=-1)
+        out = mx.fast.scaled_dot_product_attention(qp, kp, vp, scale=scale, mask=sq, sinks=sinks)
+    else:
+        out = mx.fast.scaled_dot_product_attention(qp, kp, vp, scale=scale, mask="causal", sinks=sinks)
     return out[:, :, before:before + L]

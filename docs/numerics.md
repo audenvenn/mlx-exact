@@ -67,15 +67,23 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
   - **v4** (4 or more rows): MLX's own accelerator implementation (vendored) run with a 16-row tile, exact by construction;
   - **dense v4** (unquantized, 5 or more rows): MLX's own dense accelerator GEMM loop (`gemm_loop`, vendored) with a 16-row tile, or with stock's own 128-row tile above 64 rows. The K order of an output element does not depend on the tile height, so this is the canonical arithmetic for every row count;
   - expert-indexed variants for MoE (v0 and v7 designs; each row reads its own expert's weights), and dense variants without dequantization.
-- **Attention.**
+- **Attention, head dims 64/96/128 (bf16/fp16), since 0.8.0.** mlx-exact calls MLX's own accelerator attention kernel (`attention_nax`, vendored verbatim from v0.32.4) directly, for any query count.
+  - The kernel's six function constants become template parameters, and its entry point an inline function. The arithmetic is MLX's own.
+  - For sequence b, the key, value and mask pointers start at its first valid key pads_b, and its key count is kL − pads_b. A row of a left-padded batch therefore sees exactly the keys, 32-key blocks and boundary handling of the same sequence alone.
+  - KV-cache slices are read in place (strides passed through), so there is no copy of K or V.
+  - Rows of a query tile are independent: each SIMD group owns 16 rows, and maxima and sums are reduced within a row. Decode therefore runs 16-row tiles and packs the query heads that share a KV head into the rows of one tile, reading each KV head once.
+  - Bit-identical to the padded / re-aligned path below in 828 checks: head dims 64/96/128 × bf16/fp16/fp32; decode with 1–257 keys; chunks of 2–100 queries; left-padded batches vs each sequence alone; strided cache slices. fp32 keeps the old path, since fp32 models are outside the exact matmul routes.
+- **Attention, other head dims** (192/256 with two or more KV heads; fp32; attention sinks):
   - Query blocks below the accelerator threshold are padded to 9 queries, or 16 for head dims 192/256. The real queries go last under a causal, bottom-aligned mask. If the context is shorter than the padding, a square problem with zero keys (always masked) is used instead.
   - Blocks of ≥ 1024 queries for head dims 192/256 are split below MLX's fused-kernel threshold.
-  - With a batch mask, each sequence's keys are first re-aligned to start at index 0.
+  - With a batch mask, each sequence's keys are first re-aligned to start at index 0 (a shifted copy).
   - With a sliding window (rotating KV cache), the window is put in temporal order and r = (absolute position of its first key) mod 32 masked zero keys are prepended, so each key sits at the same position within the kernel's 32-key blocks as in a full prefill.
   - Masked keys contribute exact zeros, so this reproduces the canonical rows bit for bit.
 - **Head dims 192/256 with a single KV head.** MLX's unfused attention for these head dims changes its internal matmul kernels with the query and key counts, so it is not schedule-invariant there. mlx-exact uses its own fixed-order attention instead: fp32 scores, a sequential per-row softmax, and a sequential fp32 output sum. Masked keys contribute exact zeros, so the result depends only on the order of the valid keys.
 - **Paths that mlx-lm composes from several MLX ops** (quantized KV-cache attention, LoRA adapters) have no single MLX kernel to take as canonical, so mlx-exact defines the arithmetic itself: fixed-order fp32 kernels that are identical for every query or row count. Checked against fp64, the quantized-KV attention is as accurate as stock decode, and the LoRA kernel is accurate to fp32 rounding.
 - **Gradients.** Every exact route is an `mx.custom_function` whose backward pass uses stock MLX ops. Gradients need not be bit-exact; only the forward must match, e.g. the sampler's and the trainer's log-probabilities.
+  - For attention, MLX's own gradient needs its full-attention kernel in the forward pass, which runs only for more than 8 queries. The backward pass of mlx-exact's attention routes is therefore a reference attention from plain MLX ops (fp32 scores and softmax).
+  - The shifted-copy re-alignment has its own backward pass, the same shift in reverse.
 - **Speed.** A decode step is a chain of dependent matmuls, so a kernel's *latency* matters more than its throughput.
   - With one thread per output row, every lane runs a K-long serial loop, and a 1024-output layer occupies only 32 SIMD groups. In a dependent chain this was 2.3–3.4× slower than stock per call on 0.6B-sized layers, although back-to-back independent calls were only 1.2–1.5× slower (the GPU overlaps them).
   - **v7** keeps the canonical order but splits each row. Per threadgroup of 32 rows and per 256-weight K tile, 8 producer SIMD groups (lane = 16-weight chunk) compute every chunk's four quad sums into a double buffer in threadgroup memory. Meanwhile a chain SIMD group (lane = row) adds the previous tile's quad sums into each row's fp32 accumulator in canonical order, with one barrier per tile.
@@ -93,6 +101,7 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
 | quantized KV cache (8-bit) | 300 / 300 positions identical |
 | RL with LoRA: sampler vs trainer log-probs, before and after an optimizer step | 64 / 64 identical |
 | decode throughput (mlx-lm `generate_step`) | 0.93× of stock (Qwen3-0.6B-4bit: 306 vs 330 tok/s; Qwen3-1.7B-4bit: 126 vs 136), 0.97× (Qwen3-0.6B-8bit), 0.94× (Qwen3.5-0.8B-4bit), 0.98× (Qwen3.5-0.8B bf16). Before v7: 0.68–0.79× |
+| batched decode (BatchGenerator, Qwen3-0.6B-4bit, 8 sequences; 0.8.0) | 0.89× of stock (1,125 vs 1,260 generated tok/s); 0.7.x 0.35–0.45× |
 | speculative decoding (Qwen3-1.7B-4bit + 0.6B-4bit draft) | 0.78× of stock (k = 2), 0.83× (k = 4); before multi-row kernels 0.63–0.70× |
 | chunked prefill (Qwen3-1.7B-4bit, 512 tokens) | 1.78× / 1.38× / 1.43× of stock for chunks of 16 / 64 / 128; 1.00× in one chunk |
 | MoE decode-like step (8 rows, 128 experts, 4-bit, Qwen3-30B-A3B shapes; kernel time) | 110 µs vs stock 125 µs (previous exact kernel 136 µs) |
@@ -100,7 +109,10 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
 
 ## 6. Pitfalls found along the way
 - mlx-lm's `quantized_scaled_dot_product_attention` scales its `queries` argument with `*=`, which updates the caller's array object in place. Inside a model this is harmless, but a test that reuses the same query array across calls silently feeds pre-scaled queries to later calls (it cost us a false alarm).
-- `mx.fast.metal_kernel` passes very small inputs in Metal's `constant` address space, so kernels should declare input-derived pointers with `auto`.
+- `mx.fast.metal_kernel` passes inputs with fewer than 8 elements in Metal's `constant` address space, so kernels should declare input-derived pointers with `auto`. A vendored kernel that takes `device` pointers needs inputs of at least 8 elements; mlx-exact appends never-read columns to tiny attention masks.
+- With `ensure_row_contiguous=True` (the default), `mx.fast.metal_kernel` copies every non-contiguous input before the kernel runs, KV-cache slices included. A kernel that reads the cache in place must take strides (`ensure_row_contiguous=False`).
+- MLX fills masked attention scores with the dtype's most negative finite value, so a row without any valid key averages the values. A kernel that uses −∞ must handle such rows explicitly: 0/0 gives NaN there. In a left-padded batch the padding tokens are such rows, and in the next layer their NaN values reach every real row as 0 × NaN (mlx-exact 0.7.0–0.7.1, fixed-order attention).
+- `mx.fast.scaled_dot_product_attention` has a gradient only when its full-attention kernel ran, i.e. for more than 8 queries. Custom kernels have no gradient unless they are wrapped in `mx.custom_function`. mlx-exact 0.7.0–0.7.1 lacked one on two attention routes; tests now differentiate through every route.
 - `mx.fast.metal_kernel` appends the generated `template <...>` line directly after the `header` string, so a header whose last line is a `//` comment must end with a newline, or the comment swallows the template line.
 - Every distinct value of a `metal_kernel` template parameter compiles a new kernel variant (about 0.2 s for a large header). Sizes that vary from call to call, such as the row count of a chunk or batch, should be runtime inputs.
 - An attention mask is not necessarily left padding. Re-aligning keys must shift by the earliest valid key over all query rows, which preserves every row's values; shifting by the last row's first valid key silently corrupts sliding-window layers (a bug in mlx-exact 0.1.0–0.5.2, found with the architecture sweep).

@@ -1,9 +1,10 @@
 """Architecture coverage: are tiny random-weight models of other mlx-lm architectures schedule-invariant with mlx-exact?
 For each architecture, bf16 and 4-bit: decode and chunks of 3 / 17 vs one full prefill at every position (stock vs
 mlx-exact), and exact-mode values vs stock values. Sliding windows are set below the prompt length. No download.
-Usage: python experiments/architecture_sweep.py
+Usage: python experiments/architecture_sweep.py [arch1,arch2,...]   (default: all)
 """
 import importlib
+import sys
 
 import numpy as np
 import mlx.core as mx
@@ -49,10 +50,12 @@ def check(model, ids):
     return out, full.astype(mx.float32)
 
 
-if __name__ == "__main__":
+def sweep(archs=None):
     ids = np.random.default_rng(0).integers(0, 1024, 70).tolist()
     print(f"positions bit-identical to full prefill, of {len(ids)} (decode / chunks of 3 / chunks of 17)")
     for arch, extra in CFG.items():
+        if archs and arch not in archs:
+            continue
         for mode in ("bf16", "q4"):
             try:
                 mod = importlib.import_module(f"mlx_lm.models.{arch}")
@@ -75,3 +78,7 @@ if __name__ == "__main__":
             except Exception as e:
                 mlx_exact.disable()
                 print(f"{arch:17s} {mode:4s} skipped: {type(e).__name__}: {str(e)[:80]}", flush=True)
+
+
+if __name__ == "__main__":
+    sweep(sys.argv[1].split(",") if len(sys.argv) > 1 else None)

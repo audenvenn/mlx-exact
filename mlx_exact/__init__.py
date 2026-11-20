@@ -18,13 +18,14 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .attention import STATS as _ATT_STATS
+from . import attention as _attention
 from .attention import exact_sdpa
 from .dispatch import CANONICAL, dense_stock_path, stock_qmm_path
 from .kernels import (dense_exact, dense_exact_v7, fp32_seq_matmul, gather_qmv_exact_v7, gather_qmv_nax_exact,
                       qmv_exact_bits, qmv_exact_v7, qmv_exact_v7_rows, qmv_nax_exact)
 from .nax_kernel import dense_nax_exact_v4, qmm_nax_exact_v4
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}
@@ -274,6 +275,22 @@ def enable(force=False):
         LoRALinear.__call__ = lora_call
     except ImportError:
         pass
+    # mlx-lm's attention caches store contiguous K/V while exact mode is on (a copy only for a non-contiguous input,
+    # e.g. a multi-token chunk; a decode step's K/V already are). The K/V they return then have a contiguous last
+    # dimension, which lets the exact attention kernel read them in place (attention.CONTIGUOUS_CACHES).
+    import mlx_lm.models.cache as _cache
+    _orig["caches"] = {}
+    for _name in ("KVCache", "BatchKVCache", "RotatingKVCache", "BatchRotatingKVCache", "ChunkedKVCache",
+                  "ConcatenateKVCache"):
+        _cls = getattr(_cache, _name, None)
+        if _cls is None or "update_and_fetch" not in _cls.__dict__:
+            continue
+        _orig["caches"][_cls] = _cls.__dict__["update_and_fetch"]
+
+        def _uaf(self, keys, values, _o=_orig["caches"][_cls]):
+            return _o(self, mx.contiguous(keys), mx.contiguous(values))
+        _cls.update_and_fetch = _uaf
+    _attention.CONTIGUOUS_CACHES = tuple(_orig["caches"])
     base.scaled_dot_product_attention = exact_sdpa
     _orig["mods"] = []
     for name, mod in list(sys.modules.items()):
@@ -296,6 +313,9 @@ def disable():
     if "lora" in _orig:
         from mlx_lm.tuner.lora import LoRALinear
         LoRALinear.__call__ = _orig["lora"]
+    for _cls, _f in _orig.get("caches", {}).items():
+        _cls.update_and_fetch = _f
+    _attention.CONTIGUOUS_CACHES = ()
     base.scaled_dot_product_attention = _orig["base"]
     for name in _orig["mods"]:
         sys.modules[name].scaled_dot_product_attention = _orig["base"]
