@@ -58,6 +58,7 @@ With mlx-exact the answers are identical under every schedule. Measured with 0.7
 | Greedy speculative decoding (Qwen3-1.7B + 0.6B draft, k = 2, 4) vs plain, 5 prompts × 200 tokens | 1 / 5 identical | 5 / 5 identical |
 | Batched generation (`BatchGenerator`, left padding) vs each prompt alone, 4 prompts | 1 / 4 identical | 4 / 4 identical |
 | Batched decode throughput (`BatchGenerator`, Qwen3-0.6B-4bit, 8 sequences) | 1× | 0.89× (0.7.x: 0.35–0.45×) |
+| Serving: `mlx_lm.server` (continuous batching), 16 GSM8K requests sent at once vs each alone, Qwen3-0.6B-4bit, 200 tokens | 7–8 / 16 identical (varies with arrival timing) | 16 / 16 identical |
 | MoE (mlx-lm `qwen3_moe`, 16 experts, top-4, random weights, 4-bit): decode / chunks of 4, 9, 64 vs full prefill | 0–12 / 200 positions | 200 / 200 |
 | MoE greedy with KV cache vs recompute | diverges at token 4 | identical |
 | Qwen3-0.6B-8bit: decode / chunks vs full prefill | 0 / 360 positions | 360 / 360 |

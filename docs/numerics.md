@@ -152,6 +152,13 @@ Accelerator kernel vs reconstructed order: 0 / 2048 outputs differ (an exact dot
 [stock] prompt 1: sampler == trainer log-prob on 0/64 sampled tokens; mean |Δ| 0.0431 nats, max |Δ| 0.179
 [mlx-exact] prompts 0, 1: sampler == trainer log-prob on 64/64 sampled tokens; mean |Δ| 0 nats
 ```
+**`server_identity.py`** (starts `mlx_lm.server`, stock or with `--exact`; 16 GSM8K problems via `/v1/completions`, temperature 0; about 20 s each):
+```
+stock server, mlx-community/Qwen3-0.6B-4bit: 8/16 requests give the same output alone and with 15 others in flight
+mlx-exact server, mlx-community/Qwen3-0.6B-4bit: 16/16 requests give the same output alone and with 15 others in flight
+```
+The stock count varies between runs (7/16 and 8/16 here), because continuous batching makes a request's arithmetic depend on when the other requests arrive.
+
 (Some lines are condensed here; the scripts print one line per case.)
 
 ## 8. Scope
