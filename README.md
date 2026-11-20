@@ -104,7 +104,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
   - batched generation with sliding windows;
   - caches with a kept prefix (`keep > 0`, e.g. mlx-lm's `--max-kv-size`);
   - the head-dim case below.
-- **Head dims 192/256 with a single KV head** (e.g. Gemma 3 1B): MLX computes attention for these head dims with an unfused path whose internal kernels depend on the query and key counts, and with one KV head the results differ between schedules. Since 0.7.0 mlx-exact uses its own fixed-order attention there (fp32 scores and softmax; accuracy at least stock's). It is bit-exact, but slower: prefill attention for those layers takes 9× (512 tokens) to 41× (2,048 tokens) as long as MLX's, and decode is somewhat slower. Models with two or more KV heads keep MLX's attention.
+- **Head dims 192/256 with a single KV head** (e.g. Gemma 3 1B): MLX computes attention for these head dims with an unfused path whose internal kernels depend on the query and key counts, and with one KV head the results differ between schedules. Since 0.7.0 mlx-exact uses its own fixed-order attention there (fp32 scores and softmax; accuracy at least stock's). It is bit-exact, but slower: prefill attention for those layers takes about 3× (512 tokens) to 12× (2,048 tokens) as long as MLX's, and decode attention about 2–2.5× (since 0.8.1; 0.7.0–0.8.0: 7× to 36× on the same measurement). Models with two or more KV heads keep MLX's attention.
 - **Unquantized MoE expert layers** (`SwitchLinear` → `gather_mm`) are not rerouted; quantized experts are.
 - **Boolean attention masks:** the bitwise guarantee covers causal masks with left padding, including mlx-lm's `BatchKVCache`, whose recorded padding mlx-exact uses as each sequence's key origin, and sliding windows on a rotating cache (single sequence). For other boolean masks passed without such a cache, the values are correct, but the attention kernel's key-block origin is derived from the mask and can differ between schedules.
 - **Rows with no valid key** (e.g. the padding tokens of a left-padded prefill) get unspecified finite values. Their outputs only feed other padding positions. On mlx-exact's own attention routes they get no gradient. Calls left on stock attention keep stock's gradient, which spreads such a row over all keys.
@@ -123,6 +123,7 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - the kernels against MLX's prefill and MoE kernels;
 - attention against prefill rows, and left-padding re-alignment;
 - MLX's attention kernel with per-sequence key offsets against the padded / re-aligned path; a left-padded batch through `Qwen3-0.6B-4bit` (if cached) against each sequence alone;
+- the fixed-order attention kernels against the previous (one thread per output) kernels, bit for bit (`tests/test_fixed_order.py`);
 - regression tests from an independent pre-release review (`tests/test_attention_review.py`):
   - unusual masks, layouts and shapes;
   - rows without a valid key, and a left-padded batch through a head-dim-256, single-KV-head model;
@@ -139,6 +140,9 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above. 0.8.0 also had an independent pre-release code review by another AI model (OpenAI's Codex); each reported bug was confirmed with a regression test and fixed, and the remaining points (limits of scope) are documented above.
 
 ## Changes
+- **0.8.1:** faster fixed-order attention for head dims 192/256 with one KV head (e.g. Gemma 3 1B / 270M). Prefill attention is 2.4–3× faster: 0.95 vs 2.32 ms at 512 tokens and 11.8 vs 35.4 ms at 2,048 tokens, against stock MLX's 0.32 / 0.97 ms.
+  - Every output is still the same sequential fp32 chain. Each thread now computes a 4 × 4 block of outputs from tiles staged in threadgroup memory, and one SIMD group handles each softmax row; its sum stays sequential.
+  - Results are bit-identical to 0.8.0, checked against the previous kernels in `tests/test_fixed_order.py`.
 - **0.8.0:** exact attention for head dims 64, 96 and 128 (bf16/fp16) calls MLX's own fused attention kernel directly, with per-sequence key offsets: no query padding, no key copies, and the KV cache is read in place.
   - Batched exact decode is 2× faster: Qwen3-0.6B-4bit, 8 sequences, 1,125 generated tok/s vs 566 in 0.7.1 (stock 1,260; now 0.89× of stock). One attention call (one layer of a batched decode step, 300-key cache) takes 41 µs, vs 405 µs in 0.7.1; stock's own, non-exact kernel takes 81 µs. Single-sequence decode: 0.95× of stock (Qwen3-0.6B-4bit, 318 vs 336 tok/s; 0.93× in 0.7.x).
   - Results are unchanged: bit-identical to 0.7.1 in 828 kernel checks and end to end.

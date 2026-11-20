@@ -25,7 +25,7 @@ from .kernels import (dense_exact, dense_exact_v7, fp32_seq_matmul, gather_qmv_e
                       qmv_exact_bits, qmv_exact_v7, qmv_exact_v7_rows, qmv_nax_exact)
 from .nax_kernel import dense_nax_exact_v4, qmm_nax_exact_v4
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}

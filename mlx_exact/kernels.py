@@ -844,57 +844,123 @@ def gather_qmv_exact_v7(x, w, scales, biases, idx, group_size=64, bits=4, produc
 # result depends only on the order of the valid keys, not on their indices, the key count or the query count.
 # Query / key counts are runtime arguments (no recompilation per decode step).
 # ---------------------------------------------------------------------------------------------------------------------
+# Fixed-order attention (head dims 192/256 with one KV head). Every output element is ONE sequential fp32 chain:
+# scores = (sum over d of fma(q, k)) * scale; softmax: max, exp, sequential sum over keys, scale; output = sum over
+# keys of fma(p, v). The kernels below compute exactly these chains (0.8.1: register-blocked 4 x 4 outputs per
+# thread with tiles staged through threadgroup memory, and one SIMD group per softmax row: max and exp in
+# parallel, the sum still sequential); bit-identical to the one-thread-per-output kernels of 0.7.0-0.8.0.
 _SRC_DATT_SCORES = r"""
-    const uint j = thread_position_in_grid.x;
-    const uint l = thread_position_in_grid.y;
-    const uint bh = thread_position_in_grid.z;
+    constexpr int R = 4, TJ = 32, TL = 32, DC = 16;
+    threadgroup T qs[TL][DC + 1];
+    threadgroup T ks[TJ][DC + 1];
+    const uint tx = thread_position_in_threadgroup.x;          // key group (8)
+    const uint ty = thread_position_in_threadgroup.y;          // row group (8)
+    const uint j0 = threadgroup_position_in_grid.x * TJ;
+    const uint l0 = threadgroup_position_in_grid.y * TL;
+    const uint bh = threadgroup_position_in_grid.z;
     const int L = int(dims[0]);
     const int KL = int(dims[1]);
-    if (int(j) >= KL) { return; }
     const uint b = bh / HQ, h = bh % HQ, kvh = h / (HQ / HKV);
-    auto qr = q + (size_t(bh) * L + l) * D;
-    auto kr = k + ((size_t(b) * HKV + kvh) * KL + j) * D;
-    float acc = 0.0f;
-    for (int d = 0; d < D; d++) {
-        acc = fma(float(qr[d]), float(kr[d]), acc);
+    const uint tid = ty * 8 + tx;
+    auto qb = q + (size_t(bh) * L) * D;
+    auto kb = k + ((size_t(b) * HKV + kvh) * KL) * D;
+    float acc[R][R];
+    for (int a = 0; a < R; a++) for (int c = 0; c < R; c++) acc[a][c] = 0.0f;
+    for (int d0 = 0; d0 < D; d0 += DC) {
+        for (uint i = tid; i < TL * DC; i += 64) {
+            const int r = int(l0) + int(i / DC), c = d0 + int(i % DC);
+            qs[i / DC][i % DC] = (r < L) ? qb[size_t(r) * D + c] : T(0);
+        }
+        for (uint i = tid; i < TJ * DC; i += 64) {
+            const int r = int(j0) + int(i / DC), c = d0 + int(i % DC);
+            ks[i / DC][i % DC] = (r < KL) ? kb[size_t(r) * D + c] : T(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int dd = 0; dd < DC; dd++) {
+            float qv[R], kv[R];
+            for (int a = 0; a < R; a++) qv[a] = float(qs[ty * R + a][dd]);
+            for (int c = 0; c < R; c++) kv[c] = float(ks[tx * R + c][dd]);
+            for (int a = 0; a < R; a++) for (int c = 0; c < R; c++) acc[a][c] = fma(qv[a], kv[c], acc[a][c]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    out[(size_t(bh) * L + l) * KL + j] = acc * float(scale[0]);
+    const float sc = float(scale[0]);
+    for (int a = 0; a < R; a++) {
+        const int l = int(l0 + ty * R) + a;
+        for (int c = 0; c < R; c++) {
+            const int j = int(j0 + tx * R) + c;
+            if (l < L && j < KL) out[(size_t(bh) * L + l) * KL + j] = acc[a][c] * sc;
+        }
+    }
 """
 _SRC_DATT_SOFTMAX = r"""
-    const uint l = thread_position_in_grid.x;
-    const uint bh = thread_position_in_grid.y;
+    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.x * 4 + simdgroup_index_in_threadgroup;
+    const uint bh = threadgroup_position_in_grid.y;
     const int L = int(dims[0]);
     const int KL = int(dims[1]);
-    if (int(l) >= L) { return; }
-    auto row = s + (size_t(bh) * L + l) * KL;
-    auto prow = out + (size_t(bh) * L + l) * KL;
+    if (int(row) >= L) { return; }
+    auto srow = s + (size_t(bh) * L + row) * KL;
+    auto prow = out + (size_t(bh) * L + row) * KL;
     float m = -INFINITY;
-    for (int j = 0; j < KL; j++) { m = max(m, float(row[j])); }
-    float sum = 0.0f;
-    for (int j = 0; j < KL; j++) {
-        const float e = (row[j] == -INFINITY) ? 0.0f : exp(float(row[j]) - m);
-        prow[j] = e;
-        sum += e;
+    for (int j = int(lane); j < KL; j += 32) { m = max(m, float(srow[j])); }
+    m = simd_max(m);
+    for (int j = int(lane); j < KL; j += 32) {
+        prow[j] = (srow[j] == -INFINITY) ? 0.0f : exp(float(srow[j]) - m);
     }
-    // a row without any valid key gives zeros (not 0/0 = NaN, which would reach real rows of later layers as 0 * NaN)
+    simdgroup_barrier(mem_flags::mem_device);
+    float sum = 0.0f;
+    if (lane == 0) {
+        for (int j = 0; j < KL; j++) { sum += prow[j]; }
+    }
+    sum = simd_broadcast(sum, 0);
     const float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
-    for (int j = 0; j < KL; j++) { prow[j] = prow[j] * inv; }
+    simdgroup_barrier(mem_flags::mem_device);
+    for (int j = int(lane); j < KL; j += 32) { prow[j] = prow[j] * inv; }
 """
 _SRC_DATT_OUT = r"""
-    const uint d = thread_position_in_grid.x;
-    const uint l = thread_position_in_grid.y;
-    const uint bh = thread_position_in_grid.z;
+    constexpr int R = 4, TD = 32, TL = 32, JC = 16;
+    threadgroup float ps[TL][JC + 1];
+    threadgroup T vs[JC][TD + 1];
+    const uint tx = thread_position_in_threadgroup.x;          // head-dim group (8)
+    const uint ty = thread_position_in_threadgroup.y;          // row group (8)
+    const uint d0 = threadgroup_position_in_grid.x * TD;
+    const uint l0 = threadgroup_position_in_grid.y * TL;
+    const uint bh = threadgroup_position_in_grid.z;
     const int L = int(dims[0]);
     const int KL = int(dims[1]);
-    if (int(d) >= D) { return; }
     const uint b = bh / HQ, h = bh % HQ, kvh = h / (HQ / HKV);
-    auto pr = p + (size_t(bh) * L + l) * KL;
-    auto vr = v + (size_t(b) * HKV + kvh) * size_t(KL) * D + d;
-    float acc = 0.0f;
-    for (int j = 0; j < KL; j++) {
-        acc = fma(pr[j], float(vr[size_t(j) * D]), acc);
+    const uint tid = ty * 8 + tx;
+    auto pb = p + (size_t(bh) * L) * KL;
+    auto vb = v + ((size_t(b) * HKV + kvh) * size_t(KL)) * D;
+    float acc[R][R];
+    for (int a = 0; a < R; a++) for (int c = 0; c < R; c++) acc[a][c] = 0.0f;
+    for (int j0 = 0; j0 < KL; j0 += JC) {
+        for (uint i = tid; i < TL * JC; i += 64) {
+            const int r = int(l0) + int(i / JC), c = j0 + int(i % JC);
+            ps[i / JC][i % JC] = (r < L && c < KL) ? pb[size_t(r) * KL + c] : 0.0f;
+        }
+        for (uint i = tid; i < JC * TD; i += 64) {
+            const int r = j0 + int(i / TD), c = int(d0) + int(i % TD);
+            vs[i / TD][i % TD] = (r < KL && c < D) ? vb[size_t(r) * D + c] : T(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int jn = min(JC, KL - j0);
+        for (int jj = 0; jj < jn; jj++) {
+            float pv[R], vv[R];
+            for (int a = 0; a < R; a++) pv[a] = ps[ty * R + a][jj];
+            for (int c = 0; c < R; c++) vv[c] = float(vs[jj][tx * R + c]);
+            for (int a = 0; a < R; a++) for (int c = 0; c < R; c++) acc[a][c] = fma(pv[a], vv[c], acc[a][c]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    out[(size_t(bh) * L + l) * D + d] = static_cast<T>(acc);
+    for (int a = 0; a < R; a++) {
+        const int l = int(l0 + ty * R) + a;
+        for (int c = 0; c < R; c++) {
+            const int dcol = int(d0 + tx * R) + c;
+            if (l < L && dcol < D) out[(size_t(bh) * L + l) * D + dcol] = static_cast<T>(acc[a][c]);
+        }
+    }
 """
 
 
@@ -903,28 +969,31 @@ def dense_attention_exact(queries, keys, values, scale, mask):
     or boolean array broadcastable to [B, HQ, L, kL]. Fixed-order attention, independent of L and kL."""
     B, HQ, L, D = queries.shape
     HKV, KL = keys.shape[1], keys.shape[2]
+    assert D % 16 == 0, D
     dims = mx.array([L, KL], dtype=mx.int32)
     if "datt_s" not in _kernels:
-        _kernels["datt_s"] = mx.fast.metal_kernel(name="mlx_exact_datt_scores", input_names=["q", "k", "dims", "scale"],
+        _kernels["datt_s"] = mx.fast.metal_kernel(name="mlx_exact_datt_scores_rb", input_names=["q", "k", "dims", "scale"],
                                                   output_names=["out"], source=_SRC_DATT_SCORES,
                                                   compile_options={"math_mode": "safe"})
-        _kernels["datt_m"] = mx.fast.metal_kernel(name="mlx_exact_datt_softmax", input_names=["s", "dims"], output_names=["out"],
-                                                  source=_SRC_DATT_SOFTMAX, compile_options={"math_mode": "safe"})
-        _kernels["datt_o"] = mx.fast.metal_kernel(name="mlx_exact_datt_out", input_names=["p", "v", "dims"], output_names=["out"],
-                                                  source=_SRC_DATT_OUT, compile_options={"math_mode": "safe"})
+        _kernels["datt_m"] = mx.fast.metal_kernel(name="mlx_exact_datt_softmax_sg", input_names=["s", "dims"],
+                                                  output_names=["out"], source=_SRC_DATT_SOFTMAX,
+                                                  compile_options={"math_mode": "safe"})
+        _kernels["datt_o"] = mx.fast.metal_kernel(name="mlx_exact_datt_out_rb", input_names=["p", "v", "dims"],
+                                                  output_names=["out"], source=_SRC_DATT_OUT,
+                                                  compile_options={"math_mode": "safe"})
     tmpl = [("T", queries.dtype), ("HQ", HQ), ("HKV", HKV), ("D", D)]
     s = _kernels["datt_s"](inputs=[queries, keys, dims, mx.array([scale], dtype=mx.float32)], template=tmpl,
-                           grid=(KL, L, B * HQ), threadgroup=(min(256, KL), 1, 1),
+                           grid=(((KL + 31) // 32) * 8, ((L + 31) // 32) * 8, B * HQ), threadgroup=(8, 8, 1),
                            output_shapes=[(B, HQ, L, KL)], output_dtypes=[mx.float32])[0]
     if mask is not None:
         if isinstance(mask, str):
             mask = mx.arange(KL)[None, :] <= (mx.arange(L)[:, None] + KL - L)
         s = mx.where(mask, s, -mx.inf)
-    p = _kernels["datt_m"](inputs=[s, dims], template=[("T", queries.dtype)], grid=(L, B * HQ, 1),
-                           threadgroup=(min(64, L), 1, 1), output_shapes=[(B, HQ, L, KL)], output_dtypes=[mx.float32])[0]
-    return _kernels["datt_o"](inputs=[p, values, dims], template=tmpl, grid=(D, L, B * HQ),
-                              threadgroup=(min(256, D), 1, 1), output_shapes=[(B, HQ, L, D)],
-                              output_dtypes=[queries.dtype])[0]
+    p = _kernels["datt_m"](inputs=[s, dims], template=[("T", queries.dtype)], grid=(((L + 3) // 4) * 128, B * HQ, 1),
+                           threadgroup=(128, 1, 1), output_shapes=[(B, HQ, L, KL)], output_dtypes=[mx.float32])[0]
+    return _kernels["datt_o"](inputs=[p, values, dims], template=tmpl,
+                              grid=(((D + 31) // 32) * 8, ((L + 31) // 32) * 8, B * HQ), threadgroup=(8, 8, 1),
+                              output_shapes=[(B, HQ, L, D)], output_dtypes=[queries.dtype])[0]
 
 
 # Per-sequence left shift of K / V rows (key re-alignment for batched left padding): out[b, h, j] = x[b, h, j + pad[b]],
