@@ -106,7 +106,12 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
   - In mlx-lm 0.32.2, `deepseek_v41`, `plamo2` and `muse_spark` call `mx.fast.scaled_dot_product_attention` directly.
 - **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2 (head dim 64 only; see below), granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above. Real gpt-oss: with `mlx-community/gpt-oss-20b-MXFP4-Q8` (mxfp4 experts; attention sinks; 128-token sliding windows), decode and prefill chunks are bit-identical to one full prefill at all 200 positions of a 200-token prompt (stock: 0 / 200), for a single sequence.
 - **Sliding-window attention** (rotating KV cache: Gemma 3, Cohere 2, EXAONE 4, gpt-oss, …): bit-exact for a single sequence since 0.6.0. The window is put back in temporal order and aligned to the attention kernel's 32-key blocks, with at most 31 extra masked keys per step.
-  - Batched sliding windows are bit-exact since 0.10.0 for head dims 64/96/128 (bf16/fp16) and for head dims 192/256 with one KV head. Attention sinks such as gpt-oss's are covered since 0.11.0, and head dims 192/256 with several KV heads (Gemma 3 4B and larger) since 0.12.0.
+  - Batched sliding windows are bit-exact since 0.10.0 for head dims 64/96/128 (bf16/fp16) and for head dims 192/256 with one KV head. Attention sinks such as gpt-oss's are covered since 0.11.0.
+  - **Not exact: head dims 192/256 with several KV heads** (Gemma 3 4B and larger) once the window has moved past the start of the sequence. This covers decode after more tokens than the window holds, and left-padded batches.
+    - Cause: these head dims run on MLX's unfused attention, whose softmax sums each row in a tree that depends on where the window's keys sit modulo 512 or more. mlx-exact aligns keys only modulo 32.
+    - With `mlx-community/gemma-3-4b-it-qat-4bit` and a 1,500-token prompt, chunked prefill and different prefill step sizes are bit-exact. Token-by-token decode after a 1,400-token prefill matches the full prefill at 0 of 100 positions, and a sequence left-padded by 300 in a batch differs from the same sequence alone.
+    - The tiny-model tests did not catch this: the softmax differences are rare (a few hundred in 26 million outputs) and appear only for windows longer than 128 keys.
+    - A fix is in progress.
   - In a batch, the shared ring buffer is put back in temporal order, and each sequence is shifted to its absolute positions modulo 32.
   - Not covered:
     - caches with a kept prefix (`keep > 0`, e.g. mlx-lm's `--max-kv-size`);
@@ -171,7 +176,7 @@ This code and the underlying analysis were developed with AI assistance (Anthrop
     - This hit a single prompt over 1,024 tokens on a sliding-window layer (mlx-lm prefills in 2,048-token steps), and long left-padded batches.
     - Such chunks are now split into blocks of at most 1,008 rows on MLX's unfused attention path, which decode and shorter chunks use.
   - **Fix (since 0.6.0):** when a causal chunk of 1,024 or more tokens on a sliding-window layer was split, each block re-derived its key alignment from the cache and could shift its keys by up to 31 positions. Values were correct, but the bits could differ from other schedules.
-  - **Batched sliding windows** are bit-exact for these head dims too: each sequence is placed at its absolute positions modulo 32, as on the offsets route.
+  - **Batched sliding windows** for these head dims: each sequence is placed at its absolute positions modulo 32, as on the offsets route. **Correction:** this is not enough on MLX's unfused attention, and real Gemma 3 4B decode and padded batches are not bit-exact (see *Limitations*). The tiny-model tests pass.
   - **New tests:**
     - `tests/test_long_d256.py`: a 1,100-token prompt prefilled whole, in chunks of 300, or token by token gives bit-identical logits; a left-padded batch of 1,100- and 1,040-token prompts matches each sequence alone.
     - A Gemma 3 4B-like case (head dim 256, two KV heads) in `tests/test_batch_sliding.py`, which fails with 0.11.0.
