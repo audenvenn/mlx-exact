@@ -102,10 +102,12 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - **Weights and activations:** unquantized bf16/fp16; 4- and 8-bit affine quantization with group size 64; and since 0.9.0 mxfp4 (MX format, group size 32, e.g. gpt-oss's experts). Activations bf16 or fp16. Other formats (nvfp4, mxfp8) and fp32 activations fall back to stock MLX with a warning, and exactness is then not guaranteed.
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), attention sinks combined with a quantized KV cache, and models that call `mx.fast.scaled_dot_product_attention` directly instead of mlx-lm's `scaled_dot_product_attention`.
 - **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2, granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above. Real gpt-oss: with `mlx-community/gpt-oss-20b-MXFP4-Q8` (mxfp4 experts; attention sinks; 128-token sliding windows), decode and prefill chunks are bit-identical to one full prefill at all 200 positions of a 200-token prompt (stock: 0 / 200), for a single sequence.
-- **Sliding-window attention** (rotating KV cache: Gemma 3, Cohere 2, EXAONE 4, gpt-oss, …): bit-exact for a single sequence since 0.6.0. The window is put back in temporal order and aligned to the attention kernel's 32-key blocks, with at most 31 extra masked keys per step. Not covered:
-  - batched generation with sliding windows for head dims 192/256 with two or more KV heads (Gemma 3 4B and larger). Batched sliding windows are bit-exact for head dims 64/96/128 (bf16/fp16; since 0.10.0, with attention sinks such as gpt-oss's since 0.11.0) and for head dims 192/256 with one KV head: the shared ring buffer is put back in temporal order, and each sequence is shifted to its absolute positions modulo 32;
-  - caches with a kept prefix (`keep > 0`, e.g. mlx-lm's `--max-kv-size`);
-  - the head-dim case below.
+- **Sliding-window attention** (rotating KV cache: Gemma 3, Cohere 2, EXAONE 4, gpt-oss, …): bit-exact for a single sequence since 0.6.0. The window is put back in temporal order and aligned to the attention kernel's 32-key blocks, with at most 31 extra masked keys per step.
+  - Batched sliding windows are bit-exact since 0.10.0 for head dims 64/96/128 (bf16/fp16) and for head dims 192/256 with one KV head. Attention sinks such as gpt-oss's are covered since 0.11.0, and head dims 192/256 with several KV heads (Gemma 3 4B and larger) since 0.12.0.
+  - In a batch, the shared ring buffer is put back in temporal order, and each sequence is shifted to its absolute positions modulo 32.
+  - Not covered:
+    - caches with a kept prefix (`keep > 0`, e.g. mlx-lm's `--max-kv-size`);
+    - the head-dim case below.
 - **Head dims 192/256 with a single KV head** (e.g. Gemma 3 1B): MLX computes attention for these head dims with an unfused path whose internal kernels depend on the query and key counts, and with one KV head the results differ between schedules. Since 0.7.0 mlx-exact uses its own fixed-order attention there (fp32 scores and softmax; accuracy at least stock's). It is bit-exact, but slower: prefill attention for those layers takes about 3× (512 tokens) to 12× (2,048 tokens) as long as MLX's, and decode attention about 2–2.5× (since 0.8.1; 0.7.0–0.8.0: 7× to 36× on the same measurement). Models with two or more KV heads keep MLX's attention.
 - **Unquantized MoE expert layers** (`SwitchLinear` → `gather_mm`) are not rerouted; quantized experts are.
 - **Boolean attention masks:** the bitwise guarantee covers causal masks with left padding, including mlx-lm's `BatchKVCache`, whose recorded padding mlx-exact uses as each sequence's key origin, and sliding windows on a rotating cache (single sequence). For other boolean masks passed without such a cache, the values are correct, but the attention kernel's key-block origin is derived from the mask and can differ between schedules.
@@ -127,7 +129,8 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - MLX's attention kernel with per-sequence key offsets against the padded / re-aligned path; a left-padded batch through `Qwen3-0.6B-4bit` (if cached) against each sequence alone;
 - the fixed-order attention kernels against the previous (one thread per output) kernels, bit for bit (`tests/test_fixed_order.py`);
 - mxfp4: the dense and expert kernels against stock's long-prefill and sorted expert kernels, and a tiny random gpt-oss with mxfp4 experts end to end (`tests/test_mxfp4.py`);
-- batched sliding windows: a left-padded batch through sliding-window models (gpt-oss with sinks included), every step's logits against each sequence alone (`tests/test_batch_sliding.py`);
+- batched sliding windows: a left-padded batch through sliding-window models (gpt-oss with sinks, and head dim 256 with one or two KV heads, included), every step's logits against each sequence alone (`tests/test_batch_sliding.py`);
+- prompt chunks of 1,024 or more tokens for head dim 256 with several KV heads: whole, chunked and token-by-token prefills of a 1,100-token prompt, and a long left-padded batch against each sequence alone (`tests/test_long_d256.py`);
 - attention sinks on the offsets kernel against stock MLX's sink kernel, and their gradient (`tests/test_sinks.py`);
 - regression tests from an independent pre-release review (`tests/test_attention_review.py`):
   - unusual masks, layouts and shapes;
@@ -142,16 +145,34 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - every quantized route (1, 2–4 and more rows; 4- and 8-bit) against MLX's canonical kernel, and decode plus chunk sizes 2–64 against full prefill on small random-weight models.
 
 ## Related work
-- **Batch-invariant kernels on CUDA.** Thinking Machines' [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) (2025) traced output differences in served models to kernels whose reduction order depends on the batch. It fixed them with batch-invariant kernels ([batch_invariant_ops](https://github.com/thinking-machines-lab/batch_invariant_ops)). The same idea is behind [SGLang's deterministic inference](https://lmsys.org/blog/2025-09-22-sglang-deterministic/) and [vLLM's batch invariance](https://docs.vllm.ai/en/latest/features/batch_invariance/).
-- **On MLX.** [mlx-deterministic](https://github.com/ProbioticFarmer/mlx-deterministic) (2025) brings this approach to MLX: batch-invariant RMSNorm, matmul, softmax and attention operations, with custom Metal kernels for bitwise results.
+- **Batch-invariant kernels.** Thinking Machines' [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) (2025) traced output differences in served models to kernels whose reduction order depends on the batch. It fixed them with batch-invariant kernels ([batch_invariant_ops](https://github.com/thinking-machines-lab/batch_invariant_ops)). The same idea is behind [SGLang's deterministic inference](https://lmsys.org/blog/2025-09-22-sglang-deterministic/) and [vLLM's batch invariance](https://docs.vllm.ai/en/latest/features/batch_invariance/) on CUDA.
+- **On MLX.** Two projects bring batch-invariant kernels to MLX:
+  - [mlx-batch-invariant](https://github.com/waseemh/mlx-batch-invariant) (2026): batch-invariant matmul, 4-/8-bit quantized matmul, RMSNorm and attention. Its attention gives the same bits in prefill and decode, and chunked prefill matches one-shot prefill. Its README reports identical logits at batch sizes 1–64 for Qwen2.5, SmolLM2 and GPT-2 models on an Apple M4.
+  - [mlx-deterministic](https://github.com/ProbioticFarmer/mlx-deterministic) (2025): batch-invariant RMSNorm, matmul, softmax and attention operations, with custom Metal kernels for bitwise results.
+- **Scheduling and specification (CUDA).**
+  - LLM-42 ([arXiv 2601.17768](https://arxiv.org/abs/2601.17768)) and CoRun ([arXiv 2608.14376](https://arxiv.org/abs/2608.14376)) get determinism from scheduling instead of new kernels: verify-and-rollback, or isolated prefill with fixed-shape decode.
+  - Vosti ([arXiv 2609.38981](https://arxiv.org/abs/2609.38981)) specifies deterministic inference as bitwise-identical logits across batch composition, chunking, prefill/decode execution and KV-cache reuse, and verifies an engine against it. mlx-exact targets the same property on MLX.
 - **What mlx-exact does differently.**
-  - These projects define one new reduction order and use it for every batch size. mlx-exact instead keeps the arithmetic MLX already uses for long prefills (see *How it works*) and reproduces it in every other schedule. Long prefills therefore keep stock MLX's results for most layers; the exception is head dims 192/256 with one KV head, which use mlx-exact's own fixed-order attention.
-  - mlx-exact also covers the rest of an mlx-lm inference stack: 4-/8-bit and mxfp4 weights, quantized KV caches, MoE experts, sliding windows and attention sinks, speculative decoding, batched serving, and gradients for on-policy RL.
+  - The batch-invariant projects define one new reduction order and use it for every batch size. mlx-exact instead keeps the arithmetic MLX already uses for long prefills (see *How it works*) and reproduces it in every other schedule.
+    - Long prefills therefore keep stock MLX's speed and, for most layers, its results on the M5/M6 neural accelerators.
+    - The exceptions are head dims 192/256. With one KV head they use mlx-exact's own fixed-order attention. With several KV heads, chunks of 1,024 or more tokens are split into blocks of at most 1,008 rows on MLX's unfused path; stock MLX switches to a fused kernel there.
+  - It is built for mlx-lm's batched serving: left-padded batches with array masks, `BatchGenerator` and `mlx_lm.server`.
+  - It also covers attention sinks, mxfp4 weights, sliding windows, speculative decoding, quantized KV caches, MoE experts and gradients for on-policy RL.
 
 ## Disclosure
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above. 0.8.0 also had an independent pre-release code review by another AI model (OpenAI's Codex); each reported bug was confirmed with a regression test and fixed, and the remaining points (limits of scope) are documented above.
 
 ## Changes
+- **0.12.0:** head dims 192/256 with several KV heads (Gemma 3 4B and larger).
+  - **Fix (since 0.1.0):** in exact mode, prompt chunks of 1,024 or more tokens with an array mask raised NotImplementedError.
+    - This hit a single prompt over 1,024 tokens on a sliding-window layer (mlx-lm prefills in 2,048-token steps), and long left-padded batches.
+    - Such chunks are now split into blocks of at most 1,008 rows on MLX's unfused attention path, which decode and shorter chunks use.
+  - **Fix (since 0.6.0):** when a causal chunk of 1,024 or more tokens on a sliding-window layer was split, each block re-derived its key alignment from the cache and could shift its keys by up to 31 positions. Values were correct, but the bits could differ from other schedules.
+  - **Batched sliding windows** are bit-exact for these head dims too: each sequence is placed at its absolute positions modulo 32, as on the offsets route.
+  - **New tests:**
+    - `tests/test_long_d256.py`: a 1,100-token prompt prefilled whole, in chunks of 300, or token by token gives bit-identical logits; a left-padded batch of 1,100- and 1,040-token prompts matches each sequence alone.
+    - A Gemma 3 4B-like case (head dim 256, two KV heads) in `tests/test_batch_sliding.py`, which fails with 0.11.0.
+  - **README:** a related-work section (batch-invariant kernels on CUDA and MLX; LLM-42, CoRun, Vosti).
 - **0.11.0:** attention sinks (gpt-oss) run on the exact offsets kernel for head dims 64/96/128. The kernel uses its own sink path, one logit per query head, so query heads are not packed into one tile.
   - Batched and served gpt-oss (batched sliding windows with sinks) is bit-exact.
   - Results are bit-identical to stock MLX's sink kernel (`tests/test_sinks.py`). A tiny gpt-oss with mxfp4 experts gives every step's logits bit-identical to each sequence alone in a left-padded batch (`tests/test_batch_sliding.py`; with 0.10.0 it did not).

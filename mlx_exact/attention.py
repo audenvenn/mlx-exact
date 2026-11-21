@@ -369,28 +369,51 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
                             "exactness is not guaranteed for these layers")
             STATS["sdpa_additive_mask_stock"] = STATS.get("sdpa_additive_mask_stock", 0) + 1
             return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask, sinks=sinks)
-        keys, values, mask = _align_left_padding(keys, values, mask)
-        STATS["sdpa_left_aligned"] = STATS.get("sdpa_left_aligned", 0) + 1
+        if _is_batch_rotating(cache, keys):
+            # batched sliding window (head dims outside the offsets route, e.g. 192/256 with several KV heads): temporal
+            # order and each sequence at its absolute positions mod 32, as for a single rotating cache
+            keys, values, mask = _batch_rotating_absolute(keys, values, mask, cache, L)
+            STATS["sdpa_batch_rotating_aligned"] = STATS.get("sdpa_batch_rotating_aligned", 0) + 1
+        else:
+            keys, values, mask = _align_left_padding(keys, values, mask)
+            STATS["sdpa_left_aligned"] = STATS.get("sdpa_left_aligned", 0) + 1
     # Head dims 192/256 take MLX's UNFUSED path for 9 <= qL < 1024 (separate dense matmuls; M <= 12 runs a gemv-like
     # kernel, M >= 16 the accelerator), so pad those to 16 query rows. (qL >= 1024 switches to a fused kernel and very
     # long contexts can reach split-K in P@V: not yet canonical for these head dims; see FINDINGS F12.)
-    P = 16 if D in (192, 256) else 9
     if D in (192, 256) and L >= 1024:
         # MLX switches these head dims to a fused head-dim-split kernel at >= 1024 queries: split the query block into
-        # sub-blocks of <= 1008 rows (each with its keys up to its last position; causal, bottom-aligned) so that every
-        # row goes through the same unfused path as decode and short chunks.
-        if mask is not None and not (isinstance(mask, str) and mask == "causal"):
-            raise NotImplementedError("exact mode: array masks with >= 1024 queries for head dim 192/256")
+        # sub-blocks of <= 1008 rows so that every row goes through the same unfused path as decode and short chunks.
+        if mask is not None and not isinstance(mask, str):
+            # an array mask (sliding window, left padding): each sub-block keeps every key and its own mask rows, which
+            # hide the rest (masked keys contribute exact zeros); keys are already aligned above
+            m4 = mask if mask.ndim == 4 else mask.reshape((1,) * (4 - mask.ndim) + tuple(mask.shape))
+            outs = []
+            for s0 in range(0, L, 1008):
+                e0 = min(L, s0 + 1008)
+                ms = m4 if m4.shape[-2] == 1 else m4[..., s0:e0, :]
+                outs.append(_padded_stock(queries[:, :, s0:e0], keys, values, scale, ms, sinks))
+            STATS["sdpa_split_1008_arraymask"] = STATS.get("sdpa_split_1008_arraymask", 0) + 1
+            return mx.concatenate(outs, axis=2)
+        # causal (each sub-block with its keys up to its last position, bottom-aligned) or unrestricted
         outs = []
         kL = keys.shape[2]
         causal = mask is not None
         for s0 in range(0, L, 1008):
             e0 = min(L, s0 + 1008)
             kv_end = kL - (L - e0) if causal else kL          # unrestricted attention keeps every key
-            outs.append(exact_sdpa(queries[:, :, s0:e0], keys[:, :, :kv_end], values[:, :, :kv_end], cache, scale,
+            # no cache: the keys are already aligned, and a rotating cache's offset would misplace a sub-block's keys
+            outs.append(exact_sdpa(queries[:, :, s0:e0], keys[:, :, :kv_end], values[:, :, :kv_end], None, scale,
                                    "causal" if causal else None, sinks))
         STATS["sdpa_split_1008"] = STATS.get("sdpa_split_1008", 0) + 1
         return mx.concatenate(outs, axis=2)
+    return _padded_stock(queries, keys, values, scale, mask, sinks)
+
+
+def _padded_stock(queries, keys, values, scale, mask, sinks):
+    """Stock attention on keys that are already aligned, with the query block padded so that MLX runs the same kernel
+    for every query count: to 9 rows (fused kernel), or 16 rows for head dims 192/256 (unfused path)."""
+    L, D = queries.shape[2], queries.shape[3]
+    P = 16 if D in (192, 256) else 9
     if L >= P:
         STATS["sdpa_full"] = STATS.get("sdpa_full", 0) + 1
         return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask, sinks=sinks)

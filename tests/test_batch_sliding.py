@@ -1,7 +1,8 @@
 """Batched sliding-window attention (mlx-lm BatchRotatingKVCache, e.g. BatchGenerator or mlx_lm.server with Gemma 3 /
 Cohere 2 / EXAONE 4): with mlx-exact, every sequence of a batch gets the greedy tokens it gets alone. Each sequence's
-window is put back in temporal order and shifted to its absolute positions mod 32 (offsets route), or only put in
-temporal order (fixed-order route, head dim 256 with one KV head). Tiny random-weight models; no download."""
+window is put back in temporal order and shifted to its absolute positions mod 32 (offsets route, and since 0.11.1 the
+padded stock route of head dims 192/256 with several KV heads), or only put in temporal order (fixed-order route, head
+dim 256 with one KV head). Tiny random-weight models; no download."""
 import importlib
 
 import numpy as np
@@ -16,6 +17,8 @@ CFG = {
     "cohere2": dict(layer_norm_eps=1e-5, sliding_window=32, sliding_window_pattern=2, logit_scale=1.0),
     "exaone4": dict(rope_scaling=None, sliding_window=32, sliding_window_pattern="LG"),
     "gemma3_text_d256_1kv": dict(model_type="gemma3_text", head_dim=256, num_key_value_heads=1,
+                                 query_pre_attn_scalar=256, sliding_window=32, sliding_window_pattern=2),
+    "gemma3_text_d256_2kv": dict(model_type="gemma3_text", head_dim=256, num_key_value_heads=2,     # Gemma 3 4B+
                                  query_pre_attn_scalar=256, sliding_window=32, sliding_window_pattern=2),
     "gpt_oss": dict(num_local_experts=8, num_experts_per_tok=2, sliding_window=32),     # attention sinks
 }
