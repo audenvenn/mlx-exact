@@ -64,6 +64,7 @@ With mlx-exact the answers are identical under every schedule. Measured with 0.7
 | Qwen3-0.6B-8bit: decode / chunks vs full prefill | 0 / 360 positions | 360 / 360 |
 | Qwen3.5-0.8B unquantized (bf16): decode / chunks of 4, 9, 64 vs full prefill | 0 / 360 positions | 360 / 360 |
 | gpt-oss-20b (MXFP4-Q8: mxfp4 experts, sinks, sliding windows): decode / chunks of 7 vs full prefill, 200 tokens | 0 / 200 positions | 200 / 200 (decode 0.77× of stock) |
+| Real checkpoints (mlx-community 4-bit: Llama-3.2-1B, Qwen2.5-1.5B, SmolLM3-3B, Phi-4-mini, Gemma-3-1B, Gemma-3-4B), 1,500-token prompt, `experiments/real_checkpoints.py`: decode after a 1,400-token prefill vs one chunk | 0 / 100 positions on each | 100 / 100 on each; chunks of 512, both sequences of a left-padded batch, and greedy generation with prefill steps of 2,048 vs 512 are bit-identical too |
 | Quantized KV cache (8-bit, Qwen3-0.6B-4bit): decode / chunks of 4, 9, 64 vs full prefill | 0 / 300 positions | 300 / 300 |
 | RL with LoRA (Qwen3-0.6B-4bit): sampler vs trainer log-probs of 64 sampled tokens, before and after an optimizer step | 0 / 64 identical (mean \|Δ\| ≈ 0.05 nats/token) | 64 / 64 |
 | Decode throughput (end to end, mlx-lm `generate_step`) | 1× | 0.93× (Qwen3-0.6B-4bit, Qwen3-1.7B-4bit); 0.97× (Qwen3-0.6B-8bit); 0.94× (Qwen3.5-0.8B-4bit); 0.98× (Qwen3.5-0.8B bf16) |
@@ -104,6 +105,8 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), and attention sinks combined with a quantized KV cache.
 - **Attention computed outside mlx-lm's `scaled_dot_product_attention`** is not rerouted:
   - Gemma 2 (`gemma2`) computes attention itself with raw matmuls, for its logit softcapping. A tiny head-dim-64 Gemma 2 is bit-exact in the architecture sweep. At head dim 256 (Gemma 2 2B and 9B), decode and chunks of 3 are not: 32 and 43 of 70 positions match the full prefill; chunks of 17 match at all 70.
+    - Confirmed on `mlx-community/gemma-2-2b-it-4bit`: decode after a 1,400-token prefill matches the full prefill at 0 of 100 positions, in exact mode as in stock.
+    - Batching Gemma 2 fails in mlx-lm 0.32.2 itself: its attention cannot broadcast a batch mask.
   - In mlx-lm 0.32.2, `deepseek_v41`, `plamo2` and `muse_spark` call `mx.fast.scaled_dot_product_attention` directly.
 - **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2 (head dim 64 only; see below), granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above. Real gpt-oss: with `mlx-community/gpt-oss-20b-MXFP4-Q8` (mxfp4 experts; attention sinks; 128-token sliding windows), decode and prefill chunks are bit-identical to one full prefill at all 200 positions of a 200-token prompt (stock: 0 / 200), for a single sequence.
 - **Sliding-window attention** (rotating KV cache: Gemma 3, Cohere 2, EXAONE 4, gpt-oss, …): bit-exact for a single sequence since 0.6.0. The window is put back in temporal order and aligned to the attention kernel's 32-key blocks, with at most 31 extra masked keys per step.
