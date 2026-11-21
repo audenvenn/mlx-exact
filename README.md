@@ -141,6 +141,13 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - unsupported activation dtypes fall back to stock MLX with a warning.
 - every quantized route (1, 2–4 and more rows; 4- and 8-bit) against MLX's canonical kernel, and decode plus chunk sizes 2–64 against full prefill on small random-weight models.
 
+## Related work
+- **Batch-invariant kernels on CUDA.** Thinking Machines' [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) (2025) traced output differences in served models to kernels whose reduction order depends on the batch. It fixed them with batch-invariant kernels ([batch_invariant_ops](https://github.com/thinking-machines-lab/batch_invariant_ops)). The same idea is behind [SGLang's deterministic inference](https://lmsys.org/blog/2025-09-22-sglang-deterministic/) and [vLLM's batch invariance](https://docs.vllm.ai/en/latest/features/batch_invariance/).
+- **On MLX.** [mlx-deterministic](https://github.com/ProbioticFarmer/mlx-deterministic) (2025) brings this approach to MLX: batch-invariant RMSNorm, matmul, softmax and attention operations, with custom Metal kernels for bitwise results.
+- **What mlx-exact does differently.**
+  - These projects define one new reduction order and use it for every batch size. mlx-exact instead keeps the arithmetic MLX already uses for long prefills (see *How it works*) and reproduces it in every other schedule. Long prefills therefore keep stock MLX's results for most layers; the exception is head dims 192/256 with one KV head, which use mlx-exact's own fixed-order attention.
+  - mlx-exact also covers the rest of an mlx-lm inference stack: 4-/8-bit and mxfp4 weights, quantized KV caches, MoE experts, sliding windows and attention sinks, speculative decoding, batched serving, and gradients for on-policy RL.
+
 ## Disclosure
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above. 0.8.0 also had an independent pre-release code review by another AI model (OpenAI's Codex); each reported bug was confirmed with a regression test and fixed, and the remaining points (limits of scope) are documented above.
 
