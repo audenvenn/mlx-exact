@@ -1049,3 +1049,46 @@ def shift_rows_right(x, r, out_len):
     return _kernels["shift_right"](inputs=[x, r.astype(mx.int32), mx.array([KL, out_len, H, D], dtype=mx.int32)],
                                    template=[("T", x.dtype)], grid=(D, out_len, B * H), threadgroup=(min(D, 128), 1, 1),
                                    output_shapes=[(B, H, out_len, D)], output_dtypes=[x.dtype])[0]
+
+
+# Row softmax whose bits do not depend on where a row's entries sit, up to multiples of 32 (0.12.1). One SIMD group per
+# row: lane l sums exp(x_j - max) over j = l, l + 32, l + 64, ... in index order, and the 32 lane sums are combined by a
+# fixed butterfly. Masked entries (the dtype's most negative value) contribute exact zeros, so prepending a multiple of
+# 32 of them, or appending any number, leaves every other output bit-identical. MLX's own softmax sums 4-element runs
+# per thread and then trees over 128-element groups, whose shape changes with such shifts (FINDINGS F46).
+_SRC_SOFTMAX_LANES = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.x * 4 + simdgroup_index_in_threadgroup;
+    const int R = int(dims[0]);
+    const int N = int(dims[1]);
+    if (int(row) >= R) { return; }
+    auto xr = x + size_t(row) * N;
+    auto orow = out + size_t(row) * N;
+    float m = -INFINITY;
+    for (int j = int(lane); j < N; j += 32) { m = max(m, float(xr[j])); }
+    m = simd_max(m);
+    float s = 0.0f;
+    for (int j = int(lane); j < N; j += 32) { s += exp(float(xr[j]) - m); }
+    s += simd_shuffle_xor(s, ushort(16));
+    s += simd_shuffle_xor(s, ushort(8));
+    s += simd_shuffle_xor(s, ushort(4));
+    s += simd_shuffle_xor(s, ushort(2));
+    s += simd_shuffle_xor(s, ushort(1));
+    const float inv = 1.0f / s;
+    for (int j = int(lane); j < N; j += 32) { orow[j] = static_cast<T>(exp(float(xr[j]) - m) * inv); }
+"""
+
+
+def softmax_lanes(x):
+    """Softmax over the last axis, fp32 inside, output in x's dtype; see _SRC_SOFTMAX_LANES for its invariance."""
+    shape = x.shape
+    N = shape[-1]
+    R = x.size // N
+    if "softmax_lanes" not in _kernels:
+        _kernels["softmax_lanes"] = mx.fast.metal_kernel(name="mlx_exact_softmax_lanes", input_names=["x", "dims"],
+                                                         output_names=["out"], source=_SRC_SOFTMAX_LANES,
+                                                         compile_options={"math_mode": "safe"})
+    out = _kernels["softmax_lanes"](inputs=[mx.contiguous(x.reshape(R, N)), mx.array([R, N], dtype=mx.int32)],
+                                    template=[("T", x.dtype)], grid=(((R + 3) // 4) * 128, 1, 1),
+                                    threadgroup=(128, 1, 1), output_shapes=[(R, N)], output_dtypes=[x.dtype])[0]
+    return out.reshape(shape)

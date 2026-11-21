@@ -3,12 +3,14 @@ long prefills, whatever the number of queries in the call, the context length or
 - MLX switches kernels by query count (vector kernels for <= 8 queries; for head dims 192/256 an unfused path that runs
   gemv-like matmuls for <= 12 rows, and a fused kernel for >= 1024 queries). Short query blocks are padded (9 rows, or
   16 for head dims 192/256); long blocks for head dims 192/256 are split below 1024 rows.
+- Head dims 192/256 with several KV heads (0.12.1): mlx-exact composes the unfused path itself, with a softmax whose
+  bits do not depend on where the (mod-32 aligned) keys sit; MLX's own softmax does (FINDINGS F46).
 - MLX's attention kernels align KV blocks and 16-key fragments to key index 0, so batched left padding changes the
   summation order; each sequence's keys are re-aligned to start at index 0 first.
 """
 import mlx.core as mx
 
-from .kernels import dense_attention_exact, qkv_attention_exact, shift_rows_left, shift_rows_right
+from .kernels import dense_attention_exact, qkv_attention_exact, shift_rows_left, shift_rows_right, softmax_lanes
 from .attn_nax import _dummy_mask, attention_offsets, first_valid_key
 
 STATS = {}
@@ -284,6 +286,58 @@ def _rotating_to_absolute(keys, values, mask, cache, L):
     return keys, values, m
 
 
+def unfused_attention_exact(queries, keys, values, scale, mask):
+    """MLX's unfused attention for head dims 192/256 (queries * scale, Q Kᵀ, masked entries set to the dtype's minimum,
+    softmax, P V) with two changes (0.12.1): the softmax is softmax_lanes, and every query block has at least 16 rows,
+    so both matmuls run MLX's accelerator kernels. A row's result then depends only on its query, its valid keys and
+    their positions modulo 32: not on the number of queries or keys, a leading shift by a multiple of 32, or masked keys
+    at the end (FINDINGS F46). mask: None, "causal" (bottom-right aligned) or a boolean array."""
+    B, Hq, L, D = queries.shape
+    Hkv, kL = keys.shape[1], keys.shape[2]
+    rep = Hq // Hkv
+    if mask is None:
+        m = None
+    elif isinstance(mask, str):
+        m = (mx.arange(kL)[None, :] <= (mx.arange(L)[:, None] + kL - L)).reshape(1, 1, L, kL)
+    else:
+        m = mask if mask.ndim == 4 else mask.reshape((1,) * (4 - mask.ndim) + tuple(mask.shape))
+        m = mx.broadcast_to(m, tuple(m.shape[:2]) + (L, kL))
+    if kL < 16:                                   # at least 16 keys: masked zero keys at the end
+        z = 16 - kL
+        keys = mx.concatenate([keys, mx.zeros((B, Hkv, z, D), keys.dtype)], axis=2)
+        values = mx.concatenate([values, mx.zeros((B, Hkv, z, values.shape[3]), values.dtype)], axis=2)
+        m = mx.ones((1, 1, L, kL), mx.bool_) if m is None else m
+        m = mx.concatenate([m, mx.zeros(tuple(m.shape[:3]) + (z,), mx.bool_)], axis=-1)
+        kL = 16
+    pad = 16 - L if L < 16 else 0
+    if pad:                                       # padding rows (copies of the first row, discarded) before the real rows
+        queries = mx.concatenate([mx.repeat(queries[:, :, :1], pad, axis=2), queries], axis=2)
+        if m is not None:
+            m = mx.concatenate([mx.repeat(m[..., :1, :], pad, axis=-2), m], axis=-2)
+    Lp = queries.shape[2]
+    nb = max(1, -(-Lp // 1008))                  # row blocks of >= 16 rows (memory only: rows are independent)
+    bs = -(-Lp // nb)
+    outs = []
+    for s0 in range(0, Lp, bs):
+        e0 = min(Lp, s0 + bs)
+        q = queries[:, :, s0:e0] * mx.array(scale, dtype=queries.dtype)
+        k, v = keys, values
+        mm = None if m is None else m[..., s0:e0, :]
+        n = e0 - s0
+        if rep > 1:
+            q = q.reshape(B, Hkv, rep, n, D)
+            k, v = keys[:, :, None], values[:, :, None]
+            if mm is not None:
+                mm = mm[:, :, None] if mm.shape[1] == 1 else mm.reshape(mm.shape[0], Hkv, rep, n, kL)
+        sc = q @ k.swapaxes(-1, -2)
+        if mm is not None:
+            sc = mx.where(mm, sc, mx.array(mx.finfo(sc.dtype).min, sc.dtype))
+        o = softmax_lanes(sc) @ v
+        outs.append(o.reshape(B, Hq, n, D) if rep > 1 else o)
+    out = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
+    return out[:, :, pad:] if pad else out
+
+
 def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
     """queries [B, Hq, L, D]. For L <= 8 pad to 9 rows (copies of the first row placed BEFORE the real rows) and use
     a causal mask, so MLX runs the full-attention kernel; return the last L rows."""
@@ -377,6 +431,18 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         else:
             keys, values, mask = _align_left_padding(keys, values, mask)
             STATS["sdpa_left_aligned"] = STATS.get("sdpa_left_aligned", 0) + 1
+    if (D in (192, 256) and keys.shape[1] > 1 and sinks is None and queries.dtype in OFFSETS_DTYPES
+            and keys.dtype == queries.dtype and values.dtype == queries.dtype and values.shape[-1] == D
+            and (mask is None or (isinstance(mask, str) and mask == "causal") or
+                 (not isinstance(mask, str) and mask.dtype == mx.bool_))):
+        # head dims 192/256 with several KV heads (0.12.1): MLX's unfused composition with a softmax whose bits do not
+        # depend on where the (mod-32 aligned) keys sit; any query count, no padding or splitting of the call needed
+        STATS["sdpa_unfused_exact"] = STATS.get("sdpa_unfused_exact", 0) + 1
+        kind = _mask_kind(mask)
+        fwd = lambda q, k, v, mm: unfused_attention_exact(q, k, v, scale, mm if kind == "array" else
+                                                          ("causal" if kind == "causal" else None))
+        return _differentiable("unfused_exact", fwd, scale, kind)(queries, keys, values,
+                                                                  mask if kind == "array" else _dummy_mask())
     # Head dims 192/256 take MLX's UNFUSED path for 9 <= qL < 1024 (separate dense matmuls; M <= 12 runs a gemv-like
     # kernel, M >= 16 the accelerator), so pad those to 16 query rows. (qL >= 1024 switches to a fused kernel and very
     # long contexts can reach split-K in P@V: not yet canonical for these head dims; see FINDINGS F12.)

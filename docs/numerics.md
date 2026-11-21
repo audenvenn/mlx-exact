@@ -77,7 +77,14 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
   - Attention sinks (gpt-oss) use the kernel's own sink path, one logit per query head, cast to the query dtype as MLX does. Query heads are then not packed into one tile.
   - Rows of a query tile are independent: each SIMD group owns 16 rows, and maxima and sums are reduced within a row. Decode therefore runs 16-row tiles and packs the query heads that share a KV head into the rows of one tile, reading each KV head once.
   - Bit-identical to the padded / re-aligned path below in 828 checks: head dims 64/96/128 × bf16/fp16/fp32; decode with 1–257 keys; chunks of 2–100 queries; left-padded batches vs each sequence alone; strided cache slices. fp32 keeps the old path, since fp32 models are outside the exact matmul routes.
-- **Attention, other head dims** (192/256 with two or more KV heads; fp32; attention sinks):
+- **Attention, head dims 192/256 with two or more KV heads** (since 0.12.1): mlx-exact composes MLX's unfused attention itself.
+  - The composition: queries × scale, Q Kᵀ, masked entries set to the dtype's minimum, softmax, P V. Both matmuls run on MLX's accelerator kernels with at least 16 query rows, padded as below.
+  - The softmax is mlx-exact's own (`kernels.softmax_lanes`): one SIMD group per row; lane l sums exp(x_j − max) over j ≡ l (mod 32) in index order; the 32 lane sums are combined by a fixed butterfly.
+    - Masked entries contribute exact zeros. Shifting a row by a multiple of 32, or appending masked entries, therefore leaves every output bit-identical, so the keys' existing mod-32 alignment (sliding windows, batches) is enough.
+  - MLX's own softmax is not invariant in this sense. Each thread sums 4 elements, and the per-thread sums are then reduced in trees over 128-element groups and across groups. Measured with 1,024 keys and 26 million outputs per shift, a leading shift of 32 / 64 / 128 / 256 / 512 masked entries changes 219 / 219 / 172 / 114 / 0 outputs.
+    - The accelerator matmul P V is unchanged by such shifts (0 of 6.5 million).
+    - On real Gemma 3 4B, this made decode after the window had slid, and padded batches, differ from prefill in 0.6.0–0.12.0.
+- **Attention, other head dims** (fp32; attention sinks with head dims 192/256):
   - Query blocks below the accelerator threshold are padded to 9 queries, or 16 for head dims 192/256. The real queries go last under a causal, bottom-aligned mask. If the context is shorter than the padding, a square problem with zero keys (always masked) is used instead.
   - Blocks of ≥ 1024 queries for head dims 192/256 are split into sub-blocks of at most 1,008 rows, below MLX's fused-kernel threshold.
     - With a causal mask, each sub-block takes the keys up to its last row.
