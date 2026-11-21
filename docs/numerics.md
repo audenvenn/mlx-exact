@@ -84,6 +84,11 @@ mlx-exact takes the arithmetic MLX uses for **long prefills** as canonical, so l
   - MLX's own softmax is not invariant in this sense. Each thread sums 4 elements, and the per-thread sums are then reduced in trees over 128-element groups and across groups. Measured with 1,024 keys and 26 million outputs per shift, a leading shift of 32 / 64 / 128 / 256 / 512 masked entries changes 219 / 219 / 172 / 114 / 0 outputs.
     - The accelerator matmul P V is unchanged by such shifts (0 of 6.5 million).
     - On real Gemma 3 4B, this made decode after the window had slid, and padded batches, differ from prefill in 0.6.0–0.12.0.
+- **Raw matmuls** (since 0.13.0; `mlx_exact.matmul`): while exact mode is on, `mx.array.__matmul__` and `mx.matmul` are replaced.
+  - A 2-D right operand goes to the dense Linear route, the canonical regular-accelerator-GEMM arithmetic for any number of rows.
+  - Batched products get at least 16 rows (copies of the first row before the real rows) and 16 columns (zeros). MLX then runs its accelerator kernels, and it never splits batched products along K.
+  - mlx-exact's own code calls the original matmul.
+  - Gemma 2's attention, raw matmuls with logit softcapping, also uses `softmax_lanes`. MLX's softmax runs a different kernel above 4,096 keys, so decode rows (fewer keys) and prefill rows (more) otherwise differ there.
 - **Attention, other head dims** (fp32; attention sinks with head dims 192/256):
   - Query blocks below the accelerator threshold are padded to 9 queries, or 16 for head dims 192/256. The real queries go last under a causal, bottom-aligned mask. If the context is shorter than the padding, a square problem with zero keys (always masked) is used instead.
   - Blocks of ≥ 1024 queries for head dims 192/256 are split into sub-blocks of at most 1,008 rows, below MLX's fused-kernel threshold.

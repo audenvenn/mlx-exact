@@ -64,7 +64,7 @@ With mlx-exact the answers are identical under every schedule. Measured with 0.7
 | Qwen3-0.6B-8bit: decode / chunks vs full prefill | 0 / 360 positions | 360 / 360 |
 | Qwen3.5-0.8B unquantized (bf16): decode / chunks of 4, 9, 64 vs full prefill | 0 / 360 positions | 360 / 360 |
 | gpt-oss-20b (MXFP4-Q8: mxfp4 experts, sinks, sliding windows): decode / chunks of 7 vs full prefill, 200 tokens | 0 / 200 positions | 200 / 200 (decode 0.77× of stock) |
-| Real checkpoints (mlx-community 4-bit: Llama-3.2-1B, Qwen2.5-1.5B, SmolLM3-3B, Phi-4-mini, Gemma-3-1B, Gemma-3-4B), 1,500-token prompt, `experiments/real_checkpoints.py`: decode after a 1,400-token prefill vs one chunk | 0 / 100 positions on each | 100 / 100 on each; chunks of 512, both sequences of a left-padded batch, and greedy generation with prefill steps of 2,048 vs 512 are bit-identical too |
+| Real checkpoints (mlx-community 4-bit: Llama-3.2-1B, Qwen2.5-1.5B, SmolLM3-3B, Phi-4-mini, Gemma-3-1B, Gemma-3-4B; Gemma-2-2B for single sequences), 1,500-token prompt, `experiments/real_checkpoints.py`: decode after a 1,400-token prefill vs one chunk | 0 / 100 positions on each | 100 / 100 on each; chunks of 512, both sequences of a left-padded batch, and greedy generation with prefill steps of 2,048 vs 512 are bit-identical too |
 | Quantized KV cache (8-bit, Qwen3-0.6B-4bit): decode / chunks of 4, 9, 64 vs full prefill | 0 / 300 positions | 300 / 300 |
 | RL with LoRA (Qwen3-0.6B-4bit): sampler vs trainer log-probs of 64 sampled tokens, before and after an optimizer step | 0 / 64 identical (mean \|Δ\| ≈ 0.05 nats/token) | 64 / 64 |
 | Decode throughput (end to end, mlx-lm `generate_step`) | 1× | 0.93× (Qwen3-0.6B-4bit, Qwen3-1.7B-4bit); 0.97× (Qwen3-0.6B-8bit); 0.94× (Qwen3.5-0.8B-4bit); 0.98× (Qwen3.5-0.8B bf16) |
@@ -103,12 +103,13 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - **Validated environment:** MLX 0.32.4 on Apple M6 (GPU architecture generation 18). `enable()` refuses other environments unless `force=True`, because the kernel-dispatch replica is version- and chip-specific.
 - **Weights and activations:** unquantized bf16/fp16; 4- and 8-bit affine quantization with group size 64; and since 0.9.0 mxfp4 (MX format, group size 32, e.g. gpt-oss's experts). Activations bf16 or fp16. Other formats (nvfp4, mxfp8) and fp32 activations fall back to stock MLX with a warning, and exactness is then not guaranteed.
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), and attention sinks combined with a quantized KV cache.
-- **Attention computed outside mlx-lm's `scaled_dot_product_attention`** is not rerouted:
-  - Gemma 2 (`gemma2`) computes attention itself with raw matmuls, for its logit softcapping. A tiny head-dim-64 Gemma 2 is bit-exact in the architecture sweep. At head dim 256 (Gemma 2 2B and 9B), decode and chunks of 3 are not: 32 and 43 of 70 positions match the full prefill; chunks of 17 match at all 70.
-    - Confirmed on `mlx-community/gemma-2-2b-it-4bit`: decode after a 1,400-token prefill matches the full prefill at 0 of 100 positions, in exact mode as in stock.
+- **Attention computed outside mlx-lm's `scaled_dot_product_attention`:**
+  - Gemma 2 (`gemma2`) computes attention itself with raw matmuls, for its logit softcapping. Since 0.13.0 it is bit-exact for single sequences.
+    - Its matmuls go through the raw-matmul route below, and its softmax is mlx-exact's, since MLX's switches kernels above 4,096 keys.
+    - With `mlx-community/gemma-2-2b-it-4bit`, decode after a 1,400-token prefill matches the full prefill at 100 of 100 positions (0.12.x and stock: 0).
     - Batching Gemma 2 fails in mlx-lm 0.32.2 itself: its attention cannot broadcast a batch mask.
-  - In mlx-lm 0.32.2, `deepseek_v41`, `plamo2` and `muse_spark` call `mx.fast.scaled_dot_product_attention` directly.
-- **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2 (head dim 64 only; see below), granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above. Real gpt-oss: with `mlx-community/gpt-oss-20b-MXFP4-Q8` (mxfp4 experts; attention sinks; 128-token sliding windows), decode and prefill chunks are bit-identical to one full prefill at all 200 positions of a 200-token prompt (stock: 0 / 200), for a single sequence.
+  - In mlx-lm 0.32.2, `deepseek_v41`, `plamo2` and `muse_spark` call `mx.fast.scaled_dot_product_attention` directly; those calls are not rerouted.
+- **Architectures** (tiny random-weight models, bf16 and 4-bit, `experiments/architecture_sweep.py`): decode and chunked prefill are bit-identical to full prefill for llama, qwen2, phi3, olmo2, internlm3, smollm3, hunyuan_v1_dense, seed_oss (untied head), starcoder2, gemma2, granite, glm4, lfm2 and the sliding-window families gemma3_text, cohere2, exaone4 and gpt_oss, as well as qwen3, qwen3_5 and qwen3_moe above. Real gpt-oss: with `mlx-community/gpt-oss-20b-MXFP4-Q8` (mxfp4 experts; attention sinks; 128-token sliding windows), decode and prefill chunks are bit-identical to one full prefill at all 200 positions of a 200-token prompt (stock: 0 / 200), for a single sequence.
 - **Sliding-window attention** (rotating KV cache: Gemma 3, Cohere 2, EXAONE 4, gpt-oss, …): bit-exact for a single sequence since 0.6.0. The window is put back in temporal order and aligned to the attention kernel's 32-key blocks, with at most 31 extra masked keys per step.
   - Batched sliding windows are bit-exact since 0.10.0 for head dims 64/96/128 (bf16/fp16) and for head dims 192/256 with one KV head. Attention sinks such as gpt-oss's are covered since 0.11.0.
   - **Head dims 192/256 with several KV heads** (Gemma 3 4B and larger) are bit-exact for sliding windows, alone and batched, since 0.12.1.
@@ -127,10 +128,13 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 - **Boolean attention masks:** the bitwise guarantee covers causal masks with left padding, including mlx-lm's `BatchKVCache`, whose recorded padding mlx-exact uses as each sequence's key origin, and sliding windows on a rotating cache (single sequence). For other boolean masks passed without such a cache, the values are correct, but the attention kernel's key-block origin is derived from the mask and can differ between schedules.
 - **Rows with no valid key** (e.g. the padding tokens of a left-padded prefill) get unspecified finite values. Their outputs only feed other padding positions. On mlx-exact's own attention routes they get no gradient. Calls left on stock attention keep stock's gradient, which spreads such a row over all keys.
 - **Transforms:** gradients flow through every exact route (`mx.custom_function`). `mx.vmap` over the exact kernels is not supported; batch explicitly. Attention sinks (gpt-oss) on head dims 64/96/128 run on mlx-exact's kernel, whose backward pass includes the sinks (since 0.11.0). With other head dims they run on stock MLX attention, whose gradient MLX 0.32.4 does not support with sinks.
-- **Weights applied with raw matmuls** (`x @ w.T` instead of a linear or embedding layer) are not rerouted, so those products stay schedule-dependent. In mlx-lm 0.32.2 this applies to:
-  - the MoE router gates of DeepSeek-V2/V3, GLM-4-MoE, dots1, EXAONE-MoE, MiMo-V2-Flash, Nemotron-H and Bailing-MoE-V3;
-  - DeepSeek-V3's MLA projections;
-  - the tied output layer of Llama 4, MiniCPM and Seed-OSS when `tie_word_embeddings` is set (Seed-OSS with an untied head is bit-exact).
+- **Raw matmuls** (`a @ b`, `mx.matmul`) are rerouted since 0.13.0 while exact mode is on, in every module, user code included.
+  - A 2-D right operand (a weight applied as `x @ w.T`) takes the dense route of unquantized Linear layers.
+    - In mlx-lm 0.32.2 this reroutes the MoE router gates of DeepSeek-V2/V3, GLM-4-MoE, dots1, EXAONE-MoE, MiMo-V2-Flash, Nemotron-H and Bailing-MoE-V3, and the tied output layers of Llama 4, MiniCPM and Seed-OSS, where they use `@` or `mx.matmul`.
+    - Tested end to end on tiny GLM-4-MoE and tied-head Seed-OSS models only.
+  - Batched products run on MLX's accelerator kernels, with at least 16 rows and 16 columns.
+  - Before 0.13.0 these products stayed schedule-dependent. A tiny Seed-OSS with a tied head matched the full prefill at 67 of 70 positions in decode; it now matches at 70.
+  - DeepSeek-V3's MLA remains outside: see the next item.
 - **DeepSeek-V3-style MLA** (as implemented in mlx-lm): decode uses a different, algebraically equivalent formulation than prefill, and the rotary scores are passed as an additive mask. Such layers run on stock attention: values correct, not bit-exact. Additive (non-boolean) masks in general are passed to stock attention with a warning.
 - **MoE expert layers** (`QuantizedSwitchLinear` → `gather_qmm`, 4- and 8-bit) are supported. MLX's own sorted expert kernel equals the exact kernel per expert, bit for bit. On a decode-like step with Qwen3-30B-A3B shapes (8 rows, 128 experts, 4-bit), the exact expert kernel takes 110 µs vs stock's 125 µs (kernel time; no large MoE model was run end to end).
 - **Speed:** end-to-end decode runs at 0.93–0.98× of stock on the models above (Apple M6), speculative decoding at 0.78–0.83×, and chunked prefill (chunks of 16–128 tokens) at 1.4–1.8× of stock: for those sizes MLX's own accelerator kernel with a 16-row tile, which mlx-exact runs, is faster than the kernels stock MLX picks. One-shot prefills run at stock speed. A decode step is a chain of dependent matmuls, so each kernel's latency matters more than its throughput. The decode kernels split every output row over many lanes, and keep the canonical summation order with a per-row chain of fp32 additions ([docs/numerics.md](docs/numerics.md), section 4). Unquantized models prefill at 0.73–0.98× of stock (Qwen3.5-0.8B bf16, chunks of 16–512) through MLX's own dense accelerator GEMM loop (vendored) with a 16- or 128-row tile. Remaining slow paths:
@@ -179,6 +183,17 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above. 0.8.0 also had an independent pre-release code review by another AI model (OpenAI's Codex); each reported bug was confirmed with a regression test and fixed, and the remaining points (limits of scope) are documented above.
 
 ## Changes
+- **0.13.0:** raw matmuls and Gemma 2.
+  - **Raw matmuls** (`a @ b`, `mx.matmul`) are rerouted while exact mode is on.
+    - MLX picks their kernel from the shape (gemv for one row, gemv_wide for a few, accelerator kernels from about 16 rows, split-K for some unbatched shapes), so they rounded differently in decode and prefill.
+    - Now a 2-D right operand (a weight) takes the dense Linear route, and batched products run on the accelerator kernels with at least 16 rows and columns.
+    - This covers MoE router gates and tied output layers applied with `@`, and attention written as matmuls.
+    - This applies to every `@` in the process while exact mode is on.
+  - **Gemma 2** is bit-exact for single sequences. Its attention is raw matmuls with logit softcapping, and now also uses mlx-exact's softmax, since MLX's switches kernels above 4,096 keys.
+    - With `mlx-community/gemma-2-2b-it-4bit`: decode after a 1,400-token prefill 100 of 100 positions (0.12.x and stock: 0); prefill 0.99×, decode 0.81× of stock.
+    - A tiny Gemma 2 decodes past 4,096 keys bit-identically to its prefill.
+  - The other real checkpoints (Llama-3.2-1B, Gemma-3-1B, Gemma-3-4B) are unchanged and still bit-exact in every check.
+  - **New tests:** `tests/test_raw_matmul.py`: row-count invariance of raw matmuls, tiny Gemma 2 and tied-head Seed-OSS, and Gemma 2 past 4,096 keys. All four fail without the change.
 - **0.12.1:** head dims 192/256 with several KV heads (Gemma 3 4B and larger) are bit-exact with sliding windows, decode and batches.
   - On real Gemma 3 4B, 0.12.0 (and every version since 0.6.0) was not bit-exact for decode once the window had slid, or for padded sequences in batches. The tiny-model tests had passed.
   - Cause: MLX's softmax on the unfused attention path sums each row in a tree over 128-key groups. Its bits depend on where the keys sit modulo 512 or more, while mlx-exact aligned them modulo 32. The differences are rare (a few hundred in 26 million outputs), but each one changes every later token's logits.

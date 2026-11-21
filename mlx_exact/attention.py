@@ -12,6 +12,7 @@ import mlx.core as mx
 
 from .kernels import dense_attention_exact, qkv_attention_exact, shift_rows_left, shift_rows_right, softmax_lanes
 from .attn_nax import _dummy_mask, attention_offsets, first_valid_key
+from .matmul import ORIG_MATMUL
 
 STATS = {}
 _WARNED = set()
@@ -34,7 +35,7 @@ def reference_attention(q, k, v, scale, mask, sinks=None):
     Hkv, kL = k.shape[1], k.shape[2]
     g = Hq // Hkv
     qf = (q.astype(mx.float32) * scale).reshape(B, Hkv, g, L, D)
-    s = qf @ k.astype(mx.float32)[:, :, None].swapaxes(-1, -2)                  # [B, Hkv, g, L, kL]
+    s = ORIG_MATMUL(qf, k.astype(mx.float32)[:, :, None].swapaxes(-1, -2))                  # [B, Hkv, g, L, kL]
     if isinstance(mask, str):
         m = mx.arange(kL)[None, :] <= (mx.arange(L)[:, None] + kL - L)            # [L, kL]
     elif mask is not None:
@@ -55,7 +56,7 @@ def reference_attention(q, k, v, scale, mask, sinks=None):
         p = mx.softmax(mx.concatenate([mx.broadcast_to(sk, s.shape[:-1] + (1,)), s], axis=-1), axis=-1)[..., 1:]
     else:
         p = mx.softmax(s, axis=-1)
-    o = p @ v.astype(mx.float32)[:, :, None]
+    o = ORIG_MATMUL(p, v.astype(mx.float32)[:, :, None])
     if valid is not None:
         o = mx.where(valid, o, 0.0)
     return o.reshape(B, Hq, L, v.shape[-1]).astype(q.dtype)
@@ -264,18 +265,19 @@ def _rotating_to_absolute(keys, values, mask, cache, L):
     prepend (position of its first key) mod 32 zero keys, always masked, so every key sits at an index congruent to its
     absolute position: the same block contents as in the full prefill. Masked keys contribute exact zeros."""
     B, H, kL, Dk = keys.shape
-    if L == 1 and cache.offset > kL:
-        i = int(cache._idx) % kL                               # next write slot = oldest entry of the wrapped buffer
-        if i:
-            keys = mx.concatenate([keys[:, :, i:], keys[:, :, :i]], axis=2)
-            values = mx.concatenate([values[:, :, i:], values[:, :, :i]], axis=2)
-            if mask is not None and not isinstance(mask, str):  # an array mask is in buffer order too (max_size > window)
-                mask = mx.concatenate([mask[..., i:], mask[..., :i]], axis=-1)
+    i = int(cache._idx) % kL if (L == 1 and cache.offset > kL) else 0   # next write slot = oldest entry when wrapped
     r = (int(cache.offset) - kL) % KV_BLOCK
+    if i and mask is not None and not isinstance(mask, str):  # an array mask is in buffer order too (max_size > window)
+        mask = mx.concatenate([mask[..., i:], mask[..., :i]], axis=-1)
+    if r == 0 and i == 0:
+        return keys, values, mask
+    # one copy for both the temporal order and the r leading zero keys
+    kp = ([mx.zeros((B, H, r, Dk), keys.dtype)] if r else []) + ([keys[:, :, i:], keys[:, :, :i]] if i else [keys])
+    vp = ([mx.zeros((B, values.shape[1], r, values.shape[3]), values.dtype)] if r else []) + \
+        ([values[:, :, i:], values[:, :, :i]] if i else [values])
+    keys, values = mx.concatenate(kp, axis=2), mx.concatenate(vp, axis=2)
     if r == 0:
         return keys, values, mask
-    keys = mx.concatenate([mx.zeros((B, H, r, Dk), keys.dtype), keys], axis=2)
-    values = mx.concatenate([mx.zeros((B, values.shape[1], r, values.shape[3]), values.dtype), values], axis=2)
     if mask is None:
         m = mx.ones((1, 1, L, kL), mx.bool_)
     elif isinstance(mask, str):                                # "causal", bottom-right aligned over the kL keys
@@ -329,10 +331,10 @@ def unfused_attention_exact(queries, keys, values, scale, mask):
             k, v = keys[:, :, None], values[:, :, None]
             if mm is not None:
                 mm = mm[:, :, None] if mm.shape[1] == 1 else mm.reshape(mm.shape[0], Hkv, rep, n, kL)
-        sc = q @ k.swapaxes(-1, -2)
+        sc = ORIG_MATMUL(q, k.swapaxes(-1, -2))
         if mm is not None:
             sc = mx.where(mm, sc, mx.array(mx.finfo(sc.dtype).min, sc.dtype))
-        o = softmax_lanes(sc) @ v
+        o = ORIG_MATMUL(softmax_lanes(sc), v)
         outs.append(o.reshape(B, Hq, n, D) if rep > 1 else o)
     out = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
     return out[:, :, pad:] if pad else out

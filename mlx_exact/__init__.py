@@ -21,12 +21,14 @@ from .attention import STATS as _ATT_STATS
 from . import attention as _attention
 from .attention import exact_sdpa
 from .dispatch import CANONICAL, dense_stock_path, stock_qmm_path
+from .matmul import ORIG_MATMUL
+from . import matmul as _matmul
 from .kernels import (dense_exact, dense_exact_v7, fp32_seq_matmul, gather_qmv_exact_v7, gather_qmv_nax_exact,
                       qmv_exact_bits, qmv_exact_v7, qmv_exact_v7_rows, qmv_nax_exact)
 from .nax_kernel import dense_nax_exact_v4, qmm_nax_exact_v4
 from .fp_kernel import fp_gather_exact_v4, fp_qmm_exact_v4
 
-__version__ = "0.12.1"
+__version__ = "0.13.0"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}
@@ -110,7 +112,7 @@ def dense_matmul(x, w):
         if path != "nax":
             _warn_once(("d", str(x.dtype), str(w.dtype)), f"unsupported dense layer (x {x.dtype}, w {w.dtype}, K={K}); "
                        "using stock MLX, exactness not guaranteed")
-        return (x.reshape(M, K) @ w.T).reshape(*x.shape[:-1], N)
+        return ORIG_MATMUL(x.reshape(M, K), w.T).reshape(*x.shape[:-1], N)
     # same arithmetic on every route: v7 (rows split over lanes) for decode-sized calls; otherwise MLX's own dense
     # accelerator GEMM loop (vendored) with a 16-row tile, or with stock's own 128-row tile above 64 rows
     if K % 256 == 0 and M <= 4:
@@ -217,7 +219,7 @@ def _dense_fn(x, w):
 def _dense_vjp(primals, cot, out):
     x, w = primals
     c2 = cot.reshape(-1, cot.shape[-1])
-    return (cot @ w).astype(x.dtype), (c2.T @ x.reshape(-1, x.shape[-1])).astype(w.dtype)
+    return ORIG_MATMUL(cot, w).astype(x.dtype), ORIG_MATMUL(c2.T, x.reshape(-1, x.shape[-1])).astype(w.dtype)
 
 
 @mx.custom_function
@@ -229,7 +231,8 @@ def _lora_fn(x, w):
 def _lora_vjp(primals, cot, out):
     x, w = primals
     c2 = cot.reshape(-1, cot.shape[-1])
-    return (cot @ w.T).astype(x.dtype), (x.reshape(-1, x.shape[-1]).astype(mx.float32).T @ c2).astype(w.dtype)
+    return (ORIG_MATMUL(cot, w.T).astype(x.dtype),
+            ORIG_MATMUL(x.reshape(-1, x.shape[-1]).astype(mx.float32).T, c2).astype(w.dtype))
 
 
 def enable(force=False):
@@ -316,6 +319,13 @@ def enable(force=False):
         _cls.update_and_fetch = _uaf
     _attention.CONTIGUOUS_CACHES = tuple(_orig["caches"])
     base.scaled_dot_product_attention = exact_sdpa
+    _matmul.install()                    # raw matmuls (a @ b, mx.matmul): canonical arithmetic (0.13.0)
+    try:                                 # Gemma 2 computes attention itself: its softmax becomes mlx-exact's
+        from mlx_lm.models import gemma2 as _g2
+        _orig["g2"] = _g2.Attention.__call__
+        _g2.Attention.__call__ = _matmul.gemma2_attention_call
+    except ImportError:
+        pass
     _orig["mods"] = []
     for name, mod in list(sys.modules.items()):
         if name.startswith("mlx_lm.models.") and getattr(mod, "scaled_dot_product_attention", None) is _orig["base"]:
@@ -340,6 +350,10 @@ def disable():
     for _cls, _f in _orig.get("caches", {}).items():
         _cls.update_and_fetch = _f
     _attention.CONTIGUOUS_CACHES = ()
+    _matmul.uninstall()
+    if "g2" in _orig:
+        from mlx_lm.models import gemma2 as _g2
+        _g2.Attention.__call__ = _orig.pop("g2")
     base.scaled_dot_product_attention = _orig["base"]
     for name in _orig["mods"]:
         sys.modules[name].scaled_dot_product_attention = _orig["base"]
