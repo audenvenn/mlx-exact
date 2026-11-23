@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import pytest
 
 import mlx_exact.attention as A
@@ -36,7 +37,7 @@ def _eq(a, b, rows=None):
     if rows is not None:
         sel = mx.broadcast_to(rows[..., None], a.shape)
         a, b = mx.where(sel, a, 0), mx.where(sel, b, 0)
-    return a.shape == b.shape and bool(mx.array_equal(a, b).item())
+    return a.shape == b.shape and bool(bits_equal(a, b).item())
 
 
 @pytest.mark.parametrize("D,dt", CASES)
@@ -104,7 +105,7 @@ def test_left_padded_batch_through_a_model_equals_each_sequence_alone():
         batch = model(mx.array([[0] * d + p for p, d in zip(prompts, pads)]), cache=caches)[:, -1]
         for step in range(4):
             for b in range(len(prompts)):
-                assert mx.array_equal(batch[b], solo[b]).item(), (step, b)
+                assert bits_equal(batch[b], solo[b]).item(), (step, b)
             nxt = [int(mx.argmax(s).item()) for s in solo]
             solo = [model(mx.array([[t]]), cache=c)[0, -1] for t, c in zip(nxt, solo_caches)]
             batch = model(mx.array(nxt)[:, None], cache=caches)[:, -1]

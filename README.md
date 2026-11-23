@@ -81,7 +81,7 @@ With `mlx_exact.enable()` active for both sampling and training, the two are bit
 MLX picks the kernel for a 4-bit matmul from the matrix shape:
 - `qmv` for one row;
 - `qmv_wide` for small batches;
-- split-K kernels with 2–16 partitions for medium sizes;
+- split-K kernels for medium sizes, whose partition count depends on the shape (2 up to K/64, e.g. 45 on gpt-oss's 2,880-wide layers);
 - the accelerator kernel for large sizes.
 
 These differ in two ways. Matrix-matrix kernels round each dequantized weight to bf16/fp16 before multiplying, and vector kernels do not. And each kernel sums in a different order. Attention similarly switches kernels with the number of queries, and its fixed KV blocks make left padding change the summation order.
@@ -100,7 +100,10 @@ For calls with 4 or more rows, mlx-exact runs MLX's own accelerator implementati
 The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatch, the accelerator's measured accumulation order, the consequences in stock MLX, the method, and the results. The scripts in [`experiments/`](experiments) reproduce the main measurements (stock MLX vs mlx-exact, same run).
 
 ## Limitations
-- **Validated environment:** MLX 0.32.4 on Apple M6 (GPU architecture generation 18). `enable()` refuses other environments unless `force=True`, because the kernel-dispatch replica is version- and chip-specific.
+- **Validated environment:** MLX 0.32.4 and mlx-lm 0.32.2 on one Apple M6 (GPU architecture generation 18).
+  - `enable()` refuses another MLX version, or a GPU architecture below generation 17 (or a 'd' variant), unless `force=True`. The kernel-dispatch replica is version- and chip-specific.
+  - It does not check the mlx-lm version, and it cannot tell an M6 from other generation-17+ chips. Some unsupported configurations warn and fall back to stock MLX, but direct stock calls run silently.
+  - For a new model or setup, compare the schedules you intend to use (`experiments/real_checkpoints.py` does this for a checkpoint).
 - **Weights and activations:** unquantized bf16/fp16; 4- and 8-bit affine quantization with group size 64; and since 0.9.0 mxfp4 (MX format, group size 32, e.g. gpt-oss's experts). Activations bf16 or fp16. Other formats (nvfp4, mxfp8) and fp32 activations fall back to stock MLX with a warning, and exactness is then not guaranteed.
 - **Not yet supported:** DoRA and LoRA on MoE expert layers (`LoRASwitchLinear`), and attention sinks combined with a quantized KV cache.
 - **Attention computed outside mlx-lm's `scaled_dot_product_attention`:**
@@ -123,12 +126,21 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
   - Not covered:
     - caches with a kept prefix (`keep > 0`, e.g. mlx-lm's `--max-kv-size`);
     - the head-dim case below.
+- **Head dim 512** (e.g. Gemma 4's global layers): not validated.
+  - Below 1,024 queries MLX runs these on its unfused path, and decode and short chunks match the full prefill in tiny tests.
+  - Causal prompt chunks of 1,024 or more queries switch to MLX's fused head-dim-512 kernel, which mlx-exact does not yet reroute, so long prompts are probably not bit-exact.
 - **Head dims 192/256 with a single KV head** (e.g. Gemma 3 1B): MLX computes attention for these head dims with an unfused path whose internal kernels depend on the query and key counts, and with one KV head the results differ between schedules. Since 0.7.0 mlx-exact uses its own fixed-order attention there (fp32 scores and softmax; accuracy at least stock's). It is bit-exact, but slower: prefill attention for those layers takes about 3× (512 tokens) to 12× (2,048 tokens) as long as MLX's, and decode attention about 2–2.5× (since 0.8.1; 0.7.0–0.8.0: 7× to 36× on the same measurement). Models with two or more KV heads keep MLX's attention.
 - **Unquantized MoE expert layers** (`SwitchLinear` → `gather_mm`) are not rerouted; quantized experts are.
 - **Boolean attention masks:** the bitwise guarantee covers causal masks with left padding, including mlx-lm's `BatchKVCache`, whose recorded padding mlx-exact uses as each sequence's key origin, and sliding windows on a rotating cache (single sequence). For other boolean masks passed without such a cache, the values are correct, but the attention kernel's key-block origin is derived from the mask and can differ between schedules.
 - **Rows with no valid key** (e.g. the padding tokens of a left-padded prefill) get unspecified finite values. Their outputs only feed other padding positions. On mlx-exact's own attention routes they get no gradient. Calls left on stock attention keep stock's gradient, which spreads such a row over all keys.
-- **Transforms:** gradients flow through every exact route (`mx.custom_function`). `mx.vmap` over the exact kernels is not supported; batch explicitly. Attention sinks (gpt-oss) on head dims 64/96/128 run on mlx-exact's kernel, whose backward pass includes the sinks (since 0.11.0). With other head dims they run on stock MLX attention, whose gradient MLX 0.32.4 does not support with sinks.
-- **Raw matmuls** (`a @ b`, `mx.matmul`) are rerouted since 0.13.0 while exact mode is on, in every module, user code included.
+- **Transforms:** since 0.13.1 every exact route has a backward pass (`mx.custom_function`). Backward passes use stock or fp32 reference arithmetic: they are correct gradients, not bit-exact ones. Exceptions:
+  - with a quantized KV cache, the gradient covers the queries only;
+  - attention sinks with head dims other than 64/96/128 run on stock MLX attention, whose gradient MLX 0.32.4 does not support with sinks.
+  - Before 0.13.1 there was no gradient through mxfp4 layers (since 0.9.0), Gemma 2's attention (0.13.0), or full-prefill attention with sinks (stock MLX has none).
+  - `mx.vmap` over the exact kernels is not supported; batch explicitly.
+- **Raw matmuls:** while exact mode is on, MLX's Python matmul entry points (`a @ b`, `mx.matmul`) are replaced process-wide, user code included (since 0.13.0).
+  - Products of two bf16/fp16 arrays take exact routes; other cases go to stock MLX.
+  - `mx.matmul`'s `stream=` argument is honoured since 0.13.1; 0.13.0 rejected it.
   - A 2-D right operand (a weight applied as `x @ w.T`) takes the dense route of unquantized Linear layers.
     - In mlx-lm 0.32.2 this reroutes the MoE router gates of DeepSeek-V2/V3, GLM-4-MoE, dots1, EXAONE-MoE, MiMo-V2-Flash, Nemotron-H and Bailing-MoE-V3, and the tied output layers of Llama 4, MiniCPM and Seed-OSS, where they use `@` or `mx.matmul`.
     - Tested end to end on tiny GLM-4-MoE and tied-head Seed-OSS models only.
@@ -183,6 +195,22 @@ The full analysis is in [docs/numerics.md](docs/numerics.md): the kernel dispatc
 This code and the underlying analysis were developed with AI assistance (Anthropic's Claude) and verified by the tests and measurements described above. 0.8.0 also had an independent pre-release code review by another AI model (OpenAI's Codex); each reported bug was confirmed with a regression test and fixed, and the remaining points (limits of scope) are documented above.
 
 ## Changes
+- **0.13.1:** fixes and stricter checks, prompted by an independent review of the technical report draft.
+  - **Bitwise comparison:** `mx.array_equal` treats +0 and −0 as equal, so tests based on it could not prove bit-identical results. The new `mlx_exact.testing.bits_equal` compares the stored bit patterns. All tests and `experiments/` now use it.
+    - The full suite passes under it.
+    - The seven real checkpoints pass every check bit for bit: Llama-3.2-1B, Qwen2.5-1.5B, SmolLM3-3B, Phi-4-mini, Gemma-3-1B, Gemma-3-4B, and Gemma-2-2B for single sequences.
+  - **Gradients:**
+    - mxfp4 layers had no backward pass since 0.9.0, and Gemma 2's attention had none in 0.13.0 ("VJP not implemented for CustomKernel").
+    - Full-prefill attention with sinks had none either, because stock MLX's backward pass rejects sinks.
+    - All three now have one.
+  - **`mx.matmul(a, b, stream=...)`** raised TypeError while exact mode was on (0.13.0); the stream is now honoured.
+  - **Docs:** corrected MLX's dispatch boundaries.
+    - split-K partitions go up to K/64;
+    - head dim 192 is unfused at every query count;
+    - head dim 256 switches to a fused kernel from 1,024 queries only with causal or array masks;
+    - head dim 512 has its own fused kernel for long causal prefills, now listed as not validated.
+    - The environment guard is described precisely.
+  - **New tests:** `tests/test_gradients.py`, five tests.
 - **0.13.0:** raw matmuls and Gemma 2.
   - **Raw matmuls** (`a @ b`, `mx.matmul`) are rerouted while exact mode is on.
     - MLX picks their kernel from the shape (gemv for one row, gemv_wide for a few, accelerator kernels from about 16 rows, split-K for some unbatched shapes), so they rounded differently in decode and prefill.

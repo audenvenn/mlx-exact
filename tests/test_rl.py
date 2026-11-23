@@ -2,6 +2,7 @@
 forward), bit for bit, and gradients flow through the exact routes. Small random-weight model; no download."""
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import mlx.nn as nn
 
 
@@ -42,7 +43,7 @@ def test_sampler_equals_trainer_and_gradients_flow():
             lgf = m(full[None])[0][len(prompt) - 1:-1].astype(mx.float32)
             lp = lgf - mx.logsumexp(lgf, axis=-1, keepdims=True)
             return mx.take_along_axis(lp, mx.array(toks)[:, None], axis=-1)[:, 0]
-        assert mx.array_equal(trainer_lp(model), mx.stack(s_lp)).item()
+        assert bits_equal(trainer_lp(model), mx.stack(s_lp)).item()
         loss, grads = nn.value_and_grad(model, lambda m: -mx.mean(trainer_lp(m)))(model)
         gn = sum(float(mx.sum(g.astype(mx.float32) ** 2).item()) for _, g in tree_flatten(grads))
         assert np.isfinite(float(loss.item())) and gn > 0

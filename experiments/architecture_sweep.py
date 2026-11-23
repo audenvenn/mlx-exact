@@ -8,6 +8,7 @@ import sys
 
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import mlx.nn as nn
 from mlx_lm.models.cache import make_prompt_cache
 
@@ -45,7 +46,7 @@ def check(model, ids):
         same = 0
         for s in range(0, len(ids), c):
             o = model(mx.array(ids[s:s + c])[None], cache=cache)[0]
-            same += sum(int(mx.array_equal(o[i], full[s + i]).item()) for i in range(o.shape[0]))
+            same += sum(int(bits_equal(o[i], full[s + i]).item()) for i in range(o.shape[0]))
         out[c] = same
     return out, full.astype(mx.float32)
 

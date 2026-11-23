@@ -5,6 +5,7 @@ import importlib
 
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import pytest
 
 
@@ -23,8 +24,8 @@ def test_raw_matmul_rows_do_not_depend_on_the_row_count():
     try:
         full_b, full_w = a @ b, x @ w.T
         for m in (1, 2, 3, 8, 15):
-            assert mx.array_equal(a[:, :, -m:] @ b, full_b[:, :, -m:]).item(), m
-            assert mx.array_equal(mx.matmul(x[-m:], w.T), full_w[-m:]).item(), m
+            assert bits_equal(a[:, :, -m:] @ b, full_b[:, :, -m:]).item(), m
+            assert bits_equal(mx.matmul(x[-m:], w.T), full_w[-m:]).item(), m
     finally:
         mlx_exact.disable()
 
@@ -37,7 +38,7 @@ def _sweep_check(model, ids):
         cache, same = make_prompt_cache(model), 0
         for s in range(0, len(ids), c):
             o = model(mx.array(ids[s:s + c])[None], cache=cache)[0]
-            same += sum(int(mx.array_equal(o[i], full[s + i]).item()) for i in range(o.shape[0]))
+            same += sum(int(bits_equal(o[i], full[s + i]).item()) for i in range(o.shape[0]))
         out[c] = same
     return out
 
@@ -92,4 +93,4 @@ def test_gemma2_decode_past_4096_keys_equals_prefill():
     finally:
         mlx_exact.disable()
     for p in pos:
-        assert mx.array_equal(got[p], ref[p]).item(), p
+        assert bits_equal(got[p], ref[p]).item(), p

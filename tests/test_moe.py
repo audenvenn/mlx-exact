@@ -2,6 +2,7 @@
 random-weight qwen3_moe model (no download) is schedule-invariant end to end."""
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import mlx.nn as nn
 import pytest
 
@@ -18,7 +19,7 @@ def test_expert_kernel_matches_canonical_gather(dtype):
     idx = mx.array(np.sort(rng.integers(0, E, B)).astype(np.uint32))
     canon = mx.gather_qmm(x, wq, s, b, rhs_indices=idx, transpose=True, group_size=64, bits=4, sorted_indices=True)
     ours = gather_qmv_nax_exact(x.reshape(B, K), wq, s, b, idx)
-    assert mx.array_equal(ours, canon.reshape(B, N)).item()
+    assert bits_equal(ours, canon.reshape(B, N)).item()
 
 
 @pytest.mark.parametrize("bits", [4, 8])
@@ -40,11 +41,11 @@ def test_random_moe_model_decode_equals_prefill(bits):
         full = model(mx.array(ids)[None])[0]
         cache = make_prompt_cache(model)
         for t in range(len(ids)):
-            assert mx.array_equal(model(mx.array(ids[t:t + 1])[None], cache=cache)[0, -1], full[t]).item(), t
+            assert bits_equal(model(mx.array(ids[t:t + 1])[None], cache=cache)[0, -1], full[t]).item(), t
         cache = make_prompt_cache(model)
         for s0 in range(0, len(ids), 9):
             blk = model(mx.array(ids[s0:s0 + 9])[None], cache=cache)[0]
-            assert mx.array_equal(blk, full[s0:s0 + blk.shape[0]]).item(), s0
+            assert bits_equal(blk, full[s0:s0 + blk.shape[0]]).item(), s0
     finally:
         mlx_exact.disable()
 
@@ -60,4 +61,4 @@ def test_expert_v7_kernel_matches_canonical_gather(bits, dtype, E, N, K):
     x = mx.array(rng.standard_normal((B, 1, K)).astype(np.float32)).astype(dtype)
     idx = mx.array(np.sort(rng.integers(0, E, B)).astype(np.uint32))
     canon = mx.gather_qmm(x, wq, s, b, rhs_indices=idx, transpose=True, group_size=64, bits=bits, sorted_indices=True)
-    assert mx.array_equal(gather_qmv_exact_v7(x.reshape(B, K), wq, s, b, idx, 64, bits), canon.reshape(B, N)).item()
+    assert bits_equal(gather_qmv_exact_v7(x.reshape(B, K), wq, s, b, idx, 64, bits), canon.reshape(B, N)).item()

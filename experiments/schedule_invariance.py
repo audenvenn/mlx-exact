@@ -5,6 +5,7 @@ Usage: python experiments/schedule_invariance.py [--model mlx-community/Qwen3-0.
 import argparse
 
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache
 
@@ -27,7 +28,7 @@ def run(model, ids, tag, chunks=(1, 4, 9, 16, 64, 100), n_gen=64):
         for s in range(0, len(ids), c):
             o = fwd(ids[s:s + c], cache)
             for i in range(o.shape[0]):
-                same += int(mx.array_equal(o[i], ref[s + i]).item())
+                same += int(bits_equal(o[i], ref[s + i]).item())
                 worst = max(worst, float(mx.max(mx.abs(o[i].astype(mx.float32) - ref[s + i].astype(mx.float32))).item()))
         name = "decode (1 token per step)" if c == 1 else f"chunks of {c}"
         print(f"[{tag}] {name:26s} vs full prefill: {same}/{len(ids)} positions bit-identical, max |Δlogit| {worst:.3g}")

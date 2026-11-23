@@ -7,6 +7,7 @@ import importlib
 
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import pytest
 
 BASE = dict(hidden_size=256, num_hidden_layers=2, intermediate_size=512, num_attention_heads=4, num_key_value_heads=2,
@@ -110,4 +111,4 @@ def test_batched_sliding_window_logits_equal_each_sequence_alone(name, chunk):
         mlx_exact.disable()
     for step in range(N + 1):
         for b in range(len(prompts)):
-            assert mx.array_equal(batch[step][b], solo[b][step]).item(), (name, chunk, step, b)
+            assert bits_equal(batch[step][b], solo[b][step]).item(), (name, chunk, step, b)

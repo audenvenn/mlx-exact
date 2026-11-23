@@ -2,6 +2,7 @@
 with sinks, for decode, short chunks and left-padded batches; the reference backward includes the sink logit."""
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import pytest
 
 import mlx_exact.attention as A
@@ -33,7 +34,7 @@ def test_sinks_offsets_route_matches_the_stock_kernel_path(D, Hq, Hkv, dt):
         A.STATS.clear()
         out = exact_sdpa(q, k, v, None, sc, mask, sinks=sinks)
         assert A.STATS.get("sdpa_offsets", 0) == 1
-        assert mx.array_equal(out, _reference(q, k, v, None, sc, mask, sinks=sinks)).item(), (L, kL, mask)
+        assert bits_equal(out, _reference(q, k, v, None, sc, mask, sinks=sinks)).item(), (L, kL, mask)
     B, kL = 3, 60
     for L in (1, 4, 16):
         q, k, v = _mk(rng, B, Hq, L, D, dt=dt), _mk(rng, B, Hkv, kL, D, dt=dt), _mk(rng, B, Hkv, kL, D, dt=dt)
@@ -41,11 +42,11 @@ def test_sinks_offsets_route_matches_the_stock_kernel_path(D, Hq, Hkv, dt):
         valid = mx.broadcast_to(mx.any(m, axis=-1)[..., None], (B, Hq, L, D))
         out = exact_sdpa(q, k, v, None, sc, m, sinks=sinks)
         ref = _reference(q, k, v, None, sc, m, sinks=sinks)
-        assert mx.array_equal(mx.where(valid, out, 0), mx.where(valid, ref, 0)).item(), L
+        assert bits_equal(mx.where(valid, out, 0), mx.where(valid, ref, 0)).item(), L
         for b, p in enumerate([0, 5, 33]):
             alone = _reference(q[b:b + 1], k[b:b + 1, :, p:], v[b:b + 1, :, p:], None, sc,
                                "causal" if L > 1 else None, sinks=sinks)
-            assert mx.array_equal(mx.where(valid[b:b + 1], out[b:b + 1], 0), mx.where(valid[b:b + 1], alone, 0)).item()
+            assert bits_equal(mx.where(valid[b:b + 1], out[b:b + 1], 0), mx.where(valid[b:b + 1], alone, 0)).item()
 
 
 def test_reference_attention_with_sinks_matches_stock_and_differentiates():

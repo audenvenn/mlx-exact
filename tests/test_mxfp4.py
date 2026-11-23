@@ -4,6 +4,7 @@ tiny gpt-oss model with mxfp4 experts decodes / prefills in chunks bit-identical
 download)."""
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import mlx.nn as nn
 import pytest
 
@@ -22,9 +23,9 @@ def test_dense_rows_equal_the_long_prefill_rows(dt, K, N):
     wq, sc = _q(rng, (N, K), dt)
     x = mx.array(rng.standard_normal((2048, K)).astype(np.float32)).astype(dt)
     ref = mx.quantized_matmul(x, wq, sc, None, transpose=True, group_size=32, bits=4, mode="mxfp4")
-    assert mx.array_equal(fp_qmm_exact_v4(x, wq, sc), ref).item()
+    assert bits_equal(fp_qmm_exact_v4(x, wq, sc), ref).item()
     for M in (1, 3, 16, 37):
-        assert mx.array_equal(fp_qmm_exact_v4(x[:M], wq, sc), ref[:M]).item(), M
+        assert bits_equal(fp_qmm_exact_v4(x[:M], wq, sc), ref[:M]).item(), M
 
 
 @pytest.mark.parametrize("dt", [mx.bfloat16, mx.float16])
@@ -36,7 +37,7 @@ def test_expert_kernel_equals_stock_sorted_expert_kernel(dt):
     x = mx.array(rng.standard_normal((B, 1, K)).astype(np.float32)).astype(dt)
     stock = mx.gather_qmm(x, wq, sc, None, rhs_indices=idx, transpose=True, group_size=32, bits=4, mode="mxfp4",
                           sorted_indices=True).reshape(B, N)
-    assert mx.array_equal(fp_gather_exact_v4(x.reshape(B, K), wq, sc, idx), stock).item()
+    assert bits_equal(fp_gather_exact_v4(x.reshape(B, K), wq, sc, idx), stock).item()
 
 
 def test_tiny_gpt_oss_with_mxfp4_experts_is_bit_exact():
@@ -62,7 +63,7 @@ def test_tiny_gpt_oss_with_mxfp4_experts_is_bit_exact():
             for s0 in range(0, len(ids), c):
                 out = model(mx.array(ids[s0:s0 + c])[None], cache=cache)[0]
                 for i in range(out.shape[0]):
-                    assert mx.array_equal(out[i], full[s0 + i]).item(), (c, s0 + i)
+                    assert bits_equal(out[i], full[s0 + i]).item(), (c, s0 + i)
         assert any(k.startswith("gather_mxfp4") for k, v in mlx_exact.stats()["matmul"].items() if v)
     finally:
         mlx_exact.disable()

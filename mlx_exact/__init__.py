@@ -28,7 +28,7 @@ from .kernels import (dense_exact, dense_exact_v7, fp32_seq_matmul, gather_qmv_e
 from .nax_kernel import dense_nax_exact_v4, qmm_nax_exact_v4
 from .fp_kernel import fp_gather_exact_v4, fp_qmm_exact_v4
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 VALIDATED_MLX = "0.32.4"
 _STATS = {}
 _orig = {}
@@ -210,6 +210,42 @@ def _gather_fn(group_size, bits, mode, sorted_indices):
     return _fns[key]
 
 
+def _qmm_nb_fn(group_size, bits, mode):
+    """Bias-free quantized layers (mxfp4): exact forward; backward through stock MLX (0.13.1; before, these routes
+    called Metal kernels directly and had no gradient)."""
+    key = ("qnb", group_size, bits, mode)
+    if key not in _fns:
+        @mx.custom_function
+        def f(x, w, scales):
+            return quantized_matmul(x, w, scales, None, group_size, bits, mode)
+
+        @f.vjp
+        def f_vjp(primals, cot, out):
+            x, w, scales = primals
+            dx = mx.quantized_matmul(cot, w, scales, None, transpose=False, group_size=group_size, bits=bits, mode=mode)
+            return dx.astype(x.dtype), mx.zeros_like(w), mx.zeros_like(scales)
+        _fns[key] = f
+    return _fns[key]
+
+
+def _gather_nb_fn(group_size, bits, mode, sorted_indices):
+    key = ("gnb", group_size, bits, mode, sorted_indices)
+    if key not in _fns:
+        @mx.custom_function
+        def f(x, w, scales, indices):
+            return gather_quantized_matmul(x, w, scales, None, indices, sorted_indices, group_size, bits, mode)
+
+        @f.vjp
+        def f_vjp(primals, cot, out):
+            x, w, scales, indices = primals
+            dx = mx.gather_qmm(cot, w, scales, None, rhs_indices=indices, transpose=False, group_size=group_size,
+                               bits=bits, mode=mode)
+            return (_sum_to(dx, x.shape).astype(x.dtype), mx.zeros_like(w), mx.zeros_like(scales),
+                    mx.zeros_like(indices))
+        _fns[key] = f
+    return _fns[key]
+
+
 @mx.custom_function
 def _dense_fn(x, w):
     return dense_matmul(x, w)
@@ -250,8 +286,7 @@ def enable(force=False):
     def ql_call(self, x):
         b = self.get("biases")
         if b is None:
-            y = quantized_matmul(x, self["weight"], self["scales"], None, self.group_size, self.bits,
-                                 getattr(self, "mode", "affine"))
+            y = _qmm_nb_fn(self.group_size, self.bits, getattr(self, "mode", "affine"))(x, self["weight"], self["scales"])
         else:
             y = _qmm_fn(self.group_size, self.bits, getattr(self, "mode", "affine"))(x, self["weight"], self["scales"], b)
         return y + self["bias"] if "bias" in self else y
@@ -259,8 +294,8 @@ def enable(force=False):
     def qe_as_linear(self, x):
         b = self.get("biases")
         if b is None:
-            return quantized_matmul(x, self["weight"], self["scales"], None, self.group_size, self.bits,
-                                    getattr(self, "mode", "affine"))
+            return _qmm_nb_fn(self.group_size, self.bits, getattr(self, "mode", "affine"))(x, self["weight"],
+                                                                                      self["scales"])
         return _qmm_fn(self.group_size, self.bits, getattr(self, "mode", "affine"))(x, self["weight"], self["scales"], b)
 
     def l_call(self, x):
@@ -281,8 +316,8 @@ def enable(force=False):
         b = self.get("biases")
         if b is None:
             if getattr(self, "mode", "affine") == "mxfp4":
-                y = gather_quantized_matmul(x, self["weight"], self["scales"], None, indices, bool(sorted_indices),
-                                            self.group_size, self.bits, "mxfp4")
+                y = _gather_nb_fn(self.group_size, self.bits, "mxfp4", bool(sorted_indices))(
+                    x, self["weight"], self["scales"], indices)
                 return y + mx.expand_dims(self["bias"][indices], -2) if "bias" in self else y
             return _orig["qsl"](self, x, indices, sorted_indices)
         y = _gather_fn(self.group_size, self.bits, getattr(self, "mode", "affine"), bool(sorted_indices))(

@@ -11,7 +11,7 @@ MLX picks a kernel for each operation from its shapes. For the matmuls of a lang
 |---|---|---|
 | 1 | `qmv` | GPU cores (SIMD) |
 | 2 … limit − 1 | `qmv_wide` | GPU cores (SIMD) |
-| ≥ limit, while split_k > 1 | `qmm_t_splitk` (K split into 2–16 partitions) | GPU cores (simdgroup matrix) |
+| ≥ limit, while split_k > 1 | `qmm_t_splitk` (K split into split_k partitions, 2 up to K/64) | GPU cores (simdgroup matrix) |
 | ≥ limit, split_k = 1 | `qmm_t_nax` (32-row tiles up to 32 rows, else 64-row tiles) | neural accelerators |
 
 - **limit** (on this GPU class) is 33 when K, N ≤ 2048; 25 when K, N ≤ 4096; 13 otherwise.
@@ -24,7 +24,10 @@ So, depending on prompt length, chunk size or batch size, one layer can run `qmv
 - **Attention** (`mx.fast.scaled_dot_product_attention`):
   - ≤ 8 queries use vector kernels. With grouped-query attention and ≥ 4096 keys (≥ 1024 keys on any model for Max/Ultra-class GPUs), they use a 2-pass variant whose per-block partial outputs are stored in the activation type (bf16).
   - ≥ 9 queries use the accelerator kernel.
-  - For head dims 192/256, MLX instead runs an unfused path (separate matmuls) for 9–1023 queries and a fused head-dim-split kernel from 1024.
+  - Head dims 192 and 256 take an unfused path (separate matmuls) instead, from MLX 0.32.4's `use_fallback`:
+    - head dim 192 does so at every query count;
+    - head dim 256 above 8 queries, until a fused head-dim-split kernel takes over at ≥ 1024 queries with a causal or array mask;
+    - head dim 512 switches to its own fused kernel for eligible causal prefills of ≥ 1024 queries.
 
 ## 2. The kernels compute different arithmetic
 Different kernels are not only different summation orders.

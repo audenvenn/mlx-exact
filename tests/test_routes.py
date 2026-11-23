@@ -3,6 +3,7 @@ prefills) must produce the same logits: decode and chunked prefill with chunk si
 random-weight models (no download), 4- and 8-bit."""
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import mlx.nn as nn
 import pytest
 
@@ -29,6 +30,6 @@ def test_all_chunk_sizes_match_full_prefill(bits):
             for s in range(0, len(ids), c):
                 out = model(mx.array(ids[s:s + c])[None], cache=cache)[0]
                 for i in range(out.shape[0]):
-                    assert mx.array_equal(out[i], full[s + i]).item(), (bits, c, s + i)
+                    assert bits_equal(out[i], full[s + i]).item(), (bits, c, s + i)
     finally:
         mlx_exact.disable()

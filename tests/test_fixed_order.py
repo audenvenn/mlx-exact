@@ -3,6 +3,7 @@ group per softmax row) compute exactly the arithmetic of the one-thread-per-outp
 kept here as the reference: every output bit-identical."""
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import pytest
 
 from mlx_exact.kernels import dense_attention_exact
@@ -102,4 +103,4 @@ def test_fixed_order_kernels_are_bit_identical_to_the_reference(D, L, KL, mask, 
         m = mx.array((np.arange(KL)[None, None, :] <= (np.arange(L)[None, :, None] + KL - L))
                      & (np.arange(KL)[None, None, :] >= np.array([0, 20])[:, None, None]))[:, None]
     out = dense_attention_exact(q, k, v, D ** -0.5, m)
-    assert mx.array_equal(out, _reference(q, k, v, D ** -0.5, m), equal_nan=True).item()
+    assert bits_equal(out, _reference(q, k, v, D ** -0.5, m), equal_nan=True).item()

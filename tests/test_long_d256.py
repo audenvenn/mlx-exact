@@ -9,6 +9,7 @@ import importlib
 
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 
 BASE = dict(model_type="gemma3_text", hidden_size=256, num_hidden_layers=2, intermediate_size=512,
             num_attention_heads=4, num_key_value_heads=2, head_dim=256, query_pre_attn_scalar=256, rms_norm_eps=1e-6,
@@ -46,10 +47,10 @@ def test_long_chunks_equal_short_chunks_and_decode():
         dec = [model(mx.array([[t]]), cache=cache)[0, -1] for t in ids[1080:]]
     finally:
         mlx_exact.disable()
-    assert mx.array_equal(full, chunked).item()
-    assert mx.array_equal(full[:1080], part).item()
+    assert bits_equal(full, chunked).item()
+    assert bits_equal(full[:1080], part).item()
     for i, row in enumerate(dec):
-        assert mx.array_equal(full[1080 + i], row).item(), i
+        assert bits_equal(full[1080 + i], row).item(), i
 
 
 def test_long_left_padded_batch_equals_each_sequence_alone():
@@ -77,9 +78,9 @@ def test_long_left_padded_batch_equals_each_sequence_alone():
     finally:
         mlx_exact.disable()
     for b, d in enumerate(pads):
-        assert mx.array_equal(out[b, d:], alone[b][0]).item(), b
+        assert bits_equal(out[b, d:], alone[b][0]).item(), b
         for s in range(5):
-            assert mx.array_equal(steps[s][b], alone[b][1][s]).item(), (b, s)
+            assert bits_equal(steps[s][b], alone[b][1][s]).item(), (b, s)
 
 
 def _bf(rng, *shape, mult=1.0):
@@ -94,9 +95,9 @@ def test_softmax_lanes_is_unchanged_by_mod32_shifts_and_trailing_masked_entries(
     lo = mx.array(float(mx.finfo(mx.bfloat16).min), mx.bfloat16)
     for s in (32, 64, 128, 256, 352, 512):
         xs = mx.concatenate([mx.full((8, 16, s), lo), x], axis=-1)
-        assert mx.array_equal(softmax_lanes(xs)[..., s:], ref).item(), s
+        assert bits_equal(softmax_lanes(xs)[..., s:], ref).item(), s
     xt = mx.concatenate([x, mx.full((8, 16, 77), lo)], axis=-1)
-    assert mx.array_equal(softmax_lanes(xt)[..., :1024], ref).item()
+    assert bits_equal(softmax_lanes(xt)[..., :1024], ref).item()
     exact = mx.softmax(x.astype(mx.float32), axis=-1)
     assert float(mx.max(mx.abs(ref.astype(mx.float32) - exact)).item()) < 4e-3
 

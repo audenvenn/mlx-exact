@@ -2,6 +2,7 @@
 replica predicts that path."""
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import pytest
 
 from mlx_exact.dispatch import dense_stock_path
@@ -18,7 +19,7 @@ def test_dense_kernel_matches_canonical(dtype, N, K):
     checked = 0
     for M in (65, 300, 1300):
         if dense_stock_path(M, N, K) == "nax":
-            assert mx.array_equal((x[:M] @ W.T)[:3], ours).item(), M
+            assert bits_equal((x[:M] @ W.T)[:3], ours).item(), M
             checked += 1
     assert checked >= 1
 
@@ -34,7 +35,7 @@ def test_dense_v7_matches_canonical(dtype, N, K):
     x = mx.array(rng.standard_normal((Mc, K)).astype(np.float32)).astype(dtype)
     ref = x @ W.T
     for M in (1, 2, 4):
-        assert mx.array_equal(dense_exact_v7(x[:M], W), ref[:M]).item(), M
+        assert bits_equal(dense_exact_v7(x[:M], W), ref[:M]).item(), M
 
 
 
@@ -50,7 +51,7 @@ def test_dense_v4_matches_canonical(tile, dtype, N, K):
     x = mx.array(rng.standard_normal((Mc or 128, K)).astype(np.float32)).astype(dtype)
     ref = x @ W.T if Mc else dense_exact(x, W)        # N <= 64: stock never runs the regular GEMM
     for M in (1, 5, 17, 100):
-        assert mx.array_equal(dense_nax_exact_v4(x[:M], W, tile), ref[:M]).item(), M
+        assert bits_equal(dense_nax_exact_v4(x[:M], W, tile), ref[:M]).item(), M
 
 
 def test_unquantized_model_all_chunk_sizes_match_full_prefill():
@@ -72,6 +73,6 @@ def test_unquantized_model_all_chunk_sizes_match_full_prefill():
             for s in range(0, len(ids), c):
                 out = model(mx.array(ids[s:s + c])[None], cache=cache)[0]
                 for i in range(out.shape[0]):
-                    assert mx.array_equal(out[i], full[s + i]).item(), (c, s + i)
+                    assert bits_equal(out[i], full[s + i]).item(), (c, s + i)
     finally:
         mlx_exact.disable()

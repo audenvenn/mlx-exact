@@ -2,6 +2,7 @@
 import os
 
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import pytest
 
 MODEL = os.environ.get("MLX_EXACT_TEST_MODEL", "mlx-community/Qwen3-0.6B-4bit")
@@ -23,6 +24,6 @@ def test_decode_equals_prefill():
         cache = make_prompt_cache(model)
         for t in range(len(ids)):
             row = model(mx.array(ids[t:t + 1])[None], cache=cache)[0, -1]
-            assert mx.array_equal(row, full[t]).item(), t
+            assert bits_equal(row, full[t]).item(), t
     finally:
         mlx_exact.disable()

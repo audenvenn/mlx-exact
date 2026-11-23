@@ -1,6 +1,7 @@
 """Short query blocks and left-padded batches give the same rows as full prefill."""
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import pytest
 
 from mlx_exact.attention import exact_sdpa
@@ -18,13 +19,13 @@ def test_decode_rows_equal_prefill_rows(D, HQ, HKV, T):
     full = exact_sdpa(q, k, v, None, D ** -0.5, "causal" if T > 1 else None)
     for t in range(T):
         one = exact_sdpa(q[:, :, t:t + 1], k[:, :, :t + 1], v[:, :, :t + 1], None, D ** -0.5, None)
-        assert mx.array_equal(one[:, :, 0], full[:, :, t]).item(), t
+        assert bits_equal(one[:, :, 0], full[:, :, t]).item(), t
     for c in (4, 9, 16):
         for s0 in range(0, T, c):
             e0 = min(T, s0 + c)
             blk = exact_sdpa(q[:, :, s0:e0], k[:, :, :e0], v[:, :, :e0], None, D ** -0.5,
                              "causal" if e0 - s0 > 1 else None)
-            assert mx.array_equal(blk, full[:, :, s0:e0]).item(), (c, s0)
+            assert bits_equal(blk, full[:, :, s0:e0]).item(), (c, s0)
 
 
 @pytest.mark.parametrize("n", [17, 30, 59])
@@ -37,7 +38,7 @@ def test_left_padding_is_realigned(n):
         kp = mx.concatenate([_mk(rng, 1, 8, p, D), k], axis=2)
         vp = mx.concatenate([_mk(rng, 1, 8, p, D), v], axis=2)
         m = mx.array(np.arange(n + p) >= p)[None, None, None, :]
-        assert mx.array_equal(exact_sdpa(q, kp, vp, None, D ** -0.5, m), solo).item(), p
+        assert bits_equal(exact_sdpa(q, kp, vp, None, D ** -0.5, m), solo).item(), p
 
 
 def _window_mask(L, kL, window):
@@ -76,7 +77,7 @@ def test_additive_masks_pass_through_with_warning():
         warnings.simplefilter("always")
         ours = attention.exact_sdpa(q, k, k, None, 0.125, add)
     assert any("additive" in str(r.message) for r in rec)
-    assert mx.array_equal(ours, mx.fast.scaled_dot_product_attention(q, k, k, scale=0.125, mask=add)).item()
+    assert bits_equal(ours, mx.fast.scaled_dot_product_attention(q, k, k, scale=0.125, mask=add)).item()
 
 
 def test_sliding_window_model_values_match_stock():
@@ -99,7 +100,7 @@ def test_sliding_window_model_values_match_stock():
         assert float(mx.max(mx.abs(full.astype(mx.float32) - stock)).item()) < 0.15
         cache = make_prompt_cache(model)
         for t in range(32):
-            assert mx.array_equal(model(mx.array(ids[t:t + 1])[None], cache=cache)[0, -1], full[t]).item(), t
+            assert bits_equal(model(mx.array(ids[t:t + 1])[None], cache=cache)[0, -1], full[t]).item(), t
     finally:
         mlx_exact.disable()
 
@@ -136,7 +137,7 @@ def test_sliding_window_models_are_bit_exact(arch, bits):
             for s0 in range(0, len(ids), c):
                 out = model(mx.array(ids[s0:s0 + c])[None], cache=cache)[0]
                 for i in range(out.shape[0]):
-                    assert mx.array_equal(out[i], full[s0 + i]).item(), (arch, bits, c, s0 + i)
+                    assert bits_equal(out[i], full[s0 + i]).item(), (arch, bits, c, s0 + i)
     finally:
         mlx_exact.disable()
 
@@ -179,6 +180,6 @@ def test_single_kv_head_256_model_is_bit_exact(bits):
             for s0 in range(0, len(ids), c):
                 out = model(mx.array(ids[s0:s0 + c])[None], cache=cache)[0]
                 for i in range(out.shape[0]):
-                    assert mx.array_equal(out[i], full[s0 + i]).item(), (bits, c, s0 + i)
+                    assert bits_equal(out[i], full[s0 + i]).item(), (bits, c, s0 + i)
     finally:
         mlx_exact.disable()

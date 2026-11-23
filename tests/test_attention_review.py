@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 import pytest
 
 import mlx_exact.attention as A
@@ -60,7 +61,7 @@ def test_masks_broadcast_along_keys_or_not_contiguous():
              "stepped view": (wide[..., ::2], mx.array(np.array(wide)[..., ::2]))}
     for name, (m, materialized) in cases.items():
         out = exact_sdpa(q, k, v, None, sc, m)
-        assert mx.array_equal(out, exact_sdpa(q, k, v, None, sc, materialized)).item(), name
+        assert bits_equal(out, exact_sdpa(q, k, v, None, sc, materialized)).item(), name
         assert _close(out, _stock_f32(q, k, v, sc, materialized)), name
 
 
@@ -73,8 +74,8 @@ def test_a_mask_changed_in_place_is_read_again():
     mx.eval(first)
     m[..., 0] = True                                                              # same Python object, new contents
     fresh = mx.array(np.array(m))
-    assert mx.array_equal(exact_sdpa(q, k, v, None, D ** -0.5, m), exact_sdpa(q, k, v, None, D ** -0.5, fresh)).item()
-    assert not mx.array_equal(first, exact_sdpa(q, k, v, None, D ** -0.5, fresh)).item()
+    assert bits_equal(exact_sdpa(q, k, v, None, D ** -0.5, m), exact_sdpa(q, k, v, None, D ** -0.5, fresh)).item()
+    assert not bits_equal(first, exact_sdpa(q, k, v, None, D ** -0.5, fresh)).item()
 
 
 # --- inputs ----------------------------------------------------------------------------------------------------------
@@ -87,7 +88,7 @@ def test_inputs_with_a_non_contiguous_head_dimension():
     qt = _mk(rng, B, Hq, D, L).swapaxes(-1, -2)                                   # head dim not last in memory
     for qq in (q, qt):
         ref = exact_sdpa(mx.contiguous(qq), mx.contiguous(k), mx.contiguous(v), None, D ** -0.5, "causal")
-        assert mx.array_equal(exact_sdpa(qq, k, v, None, D ** -0.5, "causal"), ref).item()
+        assert bits_equal(exact_sdpa(qq, k, v, None, D ** -0.5, "causal"), ref).item()
 
 
 def test_kv_cache_slices_are_read_in_place():
@@ -99,7 +100,7 @@ def test_kv_cache_slices_are_read_in_place():
     pads = mx.array([0, 5, 40], mx.int32)
     m = mx.array(np.arange(kL)[None, :] >= np.array([0, 5, 40])[:, None])[:, None, None, :]
     inplace = attention_offsets(q, k, v, D ** -0.5, m, pads, kv_inplace=True)
-    assert mx.array_equal(inplace, attention_offsets(q, mx.contiguous(k), mx.contiguous(v), D ** -0.5, m, pads)).item()
+    assert bits_equal(inplace, attention_offsets(q, mx.contiguous(k), mx.contiguous(v), D ** -0.5, m, pads)).item()
 
 
 def test_invalid_inputs_are_rejected():
@@ -175,7 +176,7 @@ def test_left_padded_batch_with_head_dim_256_and_one_kv_head_matches_each_sequen
         for step in range(3):
             for b in range(len(prompts)):
                 assert bool(mx.all(mx.isfinite(batch[b].astype(mx.float32))).item()), (step, b)
-                assert mx.array_equal(batch[b], solo[b]).item(), (step, b)
+                assert bits_equal(batch[b], solo[b]).item(), (step, b)
             nxt = [int(mx.argmax(s).item()) for s in solo]
             solo = [model(mx.array([[t]]), cache=c)[0, -1] for t, c in zip(nxt, solo_caches)]
             batch = model(mx.array(nxt)[:, None], cache=caches)[:, -1]
@@ -238,7 +239,7 @@ def test_k_v_returned_by_a_cache_with_a_strided_head_dimension():
             kk, vv = cache.update_and_fetch(k, v)
             out = exact_sdpa(q, kk, vv, cache, D ** -0.5, m)
             ref = exact_sdpa(q, mx.contiguous(k), mx.contiguous(v), None, D ** -0.5, m)
-            assert mx.array_equal(out, ref).item(), name
+            assert bits_equal(out, ref).item(), name
     finally:
         mlx_exact.disable()
 
@@ -259,7 +260,7 @@ def test_more_queries_than_keys():
         q, k, v = _mk(rng, 1, Hq, 3, D), _mk(rng, 1, Hkv, 2, D), _mk(rng, 1, Hkv, 2, D)
         out = exact_sdpa(q, k, v, None, D ** -0.5, mask)
         ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=D ** -0.5, mask=mask)
-        assert out.shape == (1, Hq, 3, D) and mx.array_equal(out, ref, equal_nan=True).item(), (D, mask)
+        assert out.shape == (1, Hq, 3, D) and bits_equal(out, ref, equal_nan=True).item(), (D, mask)
 
 
 def test_rotating_cache_with_a_mask_broadcast_along_keys():
@@ -274,7 +275,7 @@ def test_rotating_cache_with_a_mask_broadcast_along_keys():
         q = _mk(rng, 1, 16, 1, 128)
         one = exact_sdpa(q, kk, vv, cache, 128 ** -0.5, mx.ones((1, 1, 1, 1), mx.bool_))
         full = exact_sdpa(q, kk, vv, cache, 128 ** -0.5, mx.ones((1, 1, 1, kk.shape[2]), mx.bool_))
-        assert mx.array_equal(one, full).item()
+        assert bits_equal(one, full).item()
     finally:
         mlx_exact.disable()
 

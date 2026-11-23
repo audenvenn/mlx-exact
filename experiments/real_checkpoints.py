@@ -16,6 +16,7 @@ import mlx.core as mx
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import mlx_exact  # noqa: E402
+from mlx_exact.testing import bits_equal  # noqa: E402
 from mlx_lm import load  # noqa: E402
 from mlx_lm.generate import generate_step  # noqa: E402
 from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache, KVCache, RotatingKVCache, make_prompt_cache  # noqa: E402
@@ -39,8 +40,8 @@ def schedules(model, ids):
     for p in range(1400, 1500):
         dec[p] = model(mx.array([[ids[p]]]), cache=cache)[0, -1]
         mx.eval(dec[p])
-    return (sum(int(mx.array_equal(ref[p], chunk[p]).item()) for p in P),
-            sum(int(mx.array_equal(ref[p], dec[p]).item()) for p in range(1400, 1500)))
+    return (sum(int(bits_equal(ref[p], chunk[p]).item()) for p in P),
+            sum(int(bits_equal(ref[p], dec[p]).item()) for p in range(1400, 1500)))
 
 
 def batched(model, a, b):
@@ -62,7 +63,7 @@ def batched(model, a, b):
         got[0].append(r[0])
         got[1].append(r[1])
         mx.eval(r)
-    return [sum(int(mx.array_equal(x, y).item()) for x, y in zip(got[i], alone[i])) for i in range(2)]
+    return [sum(int(bits_equal(x, y).item()) for x, y in zip(got[i], alone[i])) for i in range(2)]
 
 
 def greedy(model, ids, step):

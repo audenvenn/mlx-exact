@@ -4,6 +4,7 @@ import warnings
 
 import numpy as np
 import mlx.core as mx
+from mlx_exact.testing import bits_equal
 
 import mlx_exact
 
@@ -19,4 +20,4 @@ def test_fp32_activations_fall_back_with_warning():
         y = mlx_exact.quantized_matmul(x, wq, s, b, group_size=64, bits=4)
     assert any("activations mlx.core.float32" in str(r.message) for r in rec)
     ref = mx.quantized_matmul(x, wq, s, b, transpose=True, group_size=64, bits=4)
-    assert mx.array_equal(y, ref).item()
+    assert bits_equal(y, ref).item()

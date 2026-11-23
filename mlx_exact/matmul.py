@@ -20,7 +20,10 @@ _MIN = 16
 STATS = {}
 
 
-def exact_matmul(a, b):
+def exact_matmul(a, b, *, stream=None):
+    if stream is not None:                    # mx.matmul's optional stream / device argument (0.13.1)
+        with mx.stream(stream):
+            return exact_matmul(a, b)
     if not (isinstance(a, mx.array) and isinstance(b, mx.array)) or a.dtype != b.dtype or a.dtype not in _DTYPES:
         return ORIG_MATMUL(a, b)
     if b.ndim == 2 and a.ndim >= 2:
@@ -63,7 +66,6 @@ def gemma2_attention_call(self, x, mask=None, cache=None):
     """mlx-lm 0.32.2's Gemma 2 attention (raw matmuls with logit softcapping) with mlx-exact's softmax. Its matmuls go
     through exact_matmul (the `@` patch). MLX's own softmax changes its reduction with the row length (a different
     kernel above 4,096 keys), so decode and prefill rows differed beyond 4,096 tokens even with exact matmuls."""
-    from .kernels import softmax_lanes
     B, L, D = x.shape
     queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
     queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
@@ -89,9 +91,22 @@ def gemma2_attention_call(self, x, mask=None, cache=None):
             scores = mx.where(mask, scores, mx.array(mx.finfo(scores.dtype).min, scores.dtype))
         else:
             scores = scores + mask
-    scores = softmax_lanes(scores) if scores.dtype in _DTYPES else mx.softmax(scores, precise=True, axis=-1)
+    scores = _softmax_lanes_fn(scores) if scores.dtype in _DTYPES else mx.softmax(scores, precise=True, axis=-1)
     output = scores @ values
     if self.repeats > 1:
         output = output.reshape(B, self.n_heads, L, self.head_dim)
     output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
     return self.o_proj(output)
+
+
+@mx.custom_function
+def _softmax_lanes_fn(x):
+    from .kernels import softmax_lanes
+    return softmax_lanes(x)
+
+
+@_softmax_lanes_fn.vjp
+def _softmax_lanes_vjp(primals, cot, out):
+    """Softmax backward (0.13.1; Gemma 2's attention had no gradient in 0.13.0): dx = p * (dy - sum(dy * p))."""
+    p, c = out.astype(mx.float32), cot.astype(mx.float32)
+    return (p * (c - mx.sum(c * p, axis=-1, keepdims=True))).astype(primals[0].dtype)

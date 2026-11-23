@@ -393,7 +393,14 @@ def exact_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         if not arr and L >= 9:
             # stock attention already runs the canonical kernel for these
             STATS["sdpa_full"] = STATS.get("sdpa_full", 0) + 1
-            return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask, sinks=sinks)
+            if sinks is None:
+                return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask)
+            # stock's own backward pass rejects sinks: same stock forward, reference backward with the sinks (0.13.1)
+            kind = _mask_kind(mask)
+            fwd = lambda q, k, v, mm, sk: mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask="causal" if kind == "causal" else None, sinks=sk)
+            return _differentiable("full_sinks", fwd, scale, kind, 1, sinks_aux=0)(queries, keys, values,
+                                                                                  _dummy_mask(), sinks)
         B = queries.shape[0]
         brot = arr and not rotating and _is_batch_rotating(cache, keys)
         if brot:
