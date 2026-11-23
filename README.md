@@ -8,7 +8,9 @@ In stock MLX, a token's logits depend on how the computation was scheduled. Full
 - a request's output depends on which other requests share its batch;
 - RL rollouts are not on-policy.
 
-`mlx_exact.enable()` makes every schedule compute the same function, bit for bit. Long prefills keep MLX's neural-accelerator speed.
+`mlx_exact.enable()` makes every schedule compute the same function, bit for bit, on the supported paths. For most layers it keeps the arithmetic of MLX's own long-prefill kernels, so one-shot prefills run close to stock speed.
+
+**Technical report:** how it works, how it was validated, and what went wrong along the way. See [Bit-exact MLX inference on Apple silicon](https://audenvenn.github.io/2026/11/23/mlx-exact-technical-report.html) (not peer-reviewed).
 
 ## Install
 Requires an Apple M5/M6 Mac (validated on M6), Python ≥ 3.10, and MLX 0.32.4 exactly, which is installed as a dependency. mlx-lm comes with the `lm` extra; validated with 0.32.2.
